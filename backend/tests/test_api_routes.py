@@ -45,3 +45,26 @@ def test_invalid_weather_version_returns_400():
     response = client.get("/api/v1/mock/weather?version=3")
 
     assert response.status_code == 400
+
+
+def test_resilience_endpoint_success():
+    response = client.get("/api/v1/resilience/weather?mode=success")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "success"
+    assert response.json()["data"]["city"] == "Indore"
+
+
+def test_resilience_endpoint_failure():
+    response = client.get(
+        "/api/v1/resilience/weather?mode=timeout&max_attempts=2"
+    )
+
+    assert response.status_code == 503
+    assert "failed after retries" in response.json()["detail"]
+
+
+def test_resilience_endpoint_invalid_mode():
+    response = client.get("/api/v1/resilience/weather?mode=invalid")
+
+    assert response.status_code == 400

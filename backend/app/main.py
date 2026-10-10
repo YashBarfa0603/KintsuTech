@@ -1,4 +1,5 @@
-
+from app.mock_apis import call_weather_api
+from app.resilience import call_with_retry
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -63,3 +64,24 @@ def reset_weather_baseline():
         "status": "ok",
         "message": "Weather baseline reset to version 1",
     }
+
+
+@app.get("/api/v1/resilience/weather")
+def resilient_weather(mode: str = "success", max_attempts: int = 3):
+    try:
+        response = call_with_retry(
+            lambda: call_weather_api(mode),
+            max_attempts=max_attempts,
+        )
+        return {
+            "status": "success",
+            "attempt_limit": max_attempts,
+            "data": response,
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (TimeoutError, ConnectionError, Exception) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Weather API failed after retries: {exc}",
+        ) from exc
