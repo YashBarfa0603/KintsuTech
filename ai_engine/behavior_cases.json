@@ -1,0 +1,94 @@
+
+{
+  "version": 1,
+  "description": "Baseline behavioral test cases for KintsuTech API resilience",
+  "cases": [
+    {
+      "id": "DEFAULT-001",
+      "category": "default_value",
+      "name": "Default page size",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {}
+      },
+      "expected": {
+        "default_page_size": 20
+      },
+      "comparison": "exact",
+      "severity": "high"
+    },
+    {
+      "id": "ERROR-001",
+      "category": "error_response",
+      "name": "Invalid input response",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {
+          "limit": -1
+        }
+      },
+      "expected": {
+        "status_code": 400,
+        "error_type": "validation_error"
+      },
+      "comparison": "contract",
+      "severity": "high"
+    },
+    {
+      "id": "PAGE-001",
+      "category": "pagination",
+      "name": "Next-page continuation",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {
+          "limit": 20
+        }
+      },
+      "expected": {
+        "has_next_page": true,
+        "next_cursor_present": true,
+        "cursor_changes_between_pages": true
+      },
+      "comparison": "contract",
+      "severity": "high"
+    },
+    {
+      "id": "RATE-001",
+      "category": "rate_limit",
+      "name": "Rate-limit response",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {}
+      },
+      "expected": {
+        "rate_limited_status_code": 429,
+        "retry_after_respected": true
+      },
+      "comparison": "contract",
+      "severity": "high"
+    },
+    {
+      "id": "SEMANTIC-001",
+      "category": "semantic_invariant",
+      "name": "Price remains non-negative",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {
+          "limit": 1
+        }
+      },
+      "expected": {
+        "price_minimum": 0,
+        "currency": "INR",
+        "unit": "rupees"
+      },
+      "comparison": "invariant",
+      "severity": "critical"
+    }
+  ]
+}

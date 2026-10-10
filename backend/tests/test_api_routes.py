@@ -3,6 +3,84 @@ from fastapi.testclient import TestClient
 
 from app.main import app, observer
 
+from unittest.mock import patch
+
+
+def test_ai_analyze_endpoint_calls_workflow():
+    expected_result = {
+        "change_report": {
+            "has_changes": True,
+            "total_change_count": 1,
+            "changes": [
+                {
+                    "source": "structural",
+                    "kind": "field_removed",
+                    "path": "temperature",
+                }
+            ],
+        },
+        "repair_workflow": {
+            "status": "pending_review",
+            "proposal": None,
+            "validation": {
+                "eligible_for_activation": False,
+                "status": "pending_review",
+            },
+        },
+    }
+
+    with patch(
+        "app.main.run_change_workflow",
+        return_value=expected_result,
+    ) as mocked_workflow:
+        response = client.post(
+            "/api/v1/ai/analyze",
+            json={
+                "baseline": {"temperature": 30},
+                "current": {"temp_c": 30},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == expected_result
+
+    mocked_workflow.assert_called_once_with(
+        baseline={"temperature": 30},
+        current={"temp_c": 30},
+        behavior_report=None,
+        text_diff=None,
+        pagination_reports=None,
+        rate_limit_reports=None,
+    )
+
+
+def test_ai_analyze_endpoint_rejects_invalid_request():
+    response = client.post(
+        "/api/v1/ai/analyze",
+        json={"baseline": {"temperature": 30}},
+    )
+
+    assert response.status_code == 422
+
+
+def test_ai_analyze_endpoint_handles_workflow_failure():
+    with patch(
+        "app.main.run_change_workflow",
+        side_effect=RuntimeError("Simulated workflow failure"),
+    ):
+        response = client.post(
+            "/api/v1/ai/analyze",
+            json={
+                "baseline": {"temperature": 30},
+                "current": {"temp_c": 30},
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "AI analysis is temporarily unavailable."
+    )
+
 client = TestClient(app)
 
 

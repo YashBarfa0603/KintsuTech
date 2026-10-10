@@ -1,12 +1,16 @@
+import sys
 import time
+from pathlib import Path
+from typing import Any
 
-from app.integration_schemas import ChangeAnalysisRequest, ChangeAnalysisResponse
-from app.change_detector import detect_changes
-from app.change_analyzer import analyze_changes
-from app.health_monitor import APIHealthMonitor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Any
+from pydantic import BaseModel
+
+from app.change_analyzer import analyze_changes
+from app.change_detector import detect_changes
+from app.health_monitor import APIHealthMonitor
+from app.integration_schemas import ChangeAnalysisRequest, ChangeAnalysisResponse
 from app.mock_apis import (
     SimulatedAPIError,
     call_weather_api,
@@ -14,6 +18,27 @@ from app.mock_apis import (
 )
 from app.observer import APIObserver
 from app.resilience import call_with_retry
+
+
+# Import the AI engine
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+AI_ENGINE_PATH = PROJECT_ROOT / "ai_engine"
+
+if str(AI_ENGINE_PATH) not in sys.path:
+    sys.path.insert(0, str(AI_ENGINE_PATH))
+
+from change_workflow import run_change_workflow
+
+
+# Request model for AI analysis
+class AIAnalyzeRequest(BaseModel):
+    baseline: dict[str, Any]
+    current: dict[str, Any]
+    behavior_report: dict[str, Any] | None = None
+    text_diff: list[dict[str, str]] | None = None
+    pagination_reports: list[dict[str, Any]] | None = None
+    rate_limit_reports: list[dict[str, Any]] | None = None
+
 
 app = FastAPI(
     title="KintsuTech",
@@ -38,7 +63,6 @@ health_monitor = APIHealthMonitor()
 
 @app.get("/api/v1/health")
 def health_check():
-    """Check whether the backend is running."""
     return {
         "status": "ok",
         "service": "KintsuTech",
@@ -47,38 +71,25 @@ def health_check():
 
 @app.get("/api/v1/mock/weather")
 def mock_weather(version: int = 1):
-    """Return a simulated weather API response."""
     try:
         return get_weather_response(version=version)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
-
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/observe/weather")
 def observe_weather(version: int = 1):
-    """Observe a weather response and detect changes."""
     try:
         response = get_weather_response(version=version)
     except ValueError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     observation = observer.capture("weather", response)
-
-    return {
-        "observation": observation,
-    }
+    return {"observation": observation}
 
 
 @app.post("/api/v1/observe/weather/reset")
 def reset_weather_observation():
-    """Reset the weather baseline to version 1."""
     baseline = get_weather_response(version=1)
     observer.update_baseline("weather", baseline)
 
@@ -89,13 +100,8 @@ def reset_weather_observation():
     }
 
 
-
 @app.get("/api/v1/resilience/weather")
-def resilient_weather(
-    mode: str = "success",
-    max_attempts: int = 3,
-):
-    """Call the simulated weather API with retries and track health."""
+def resilient_weather(mode: str = "success", max_attempts: int = 3):
     start_time = time.perf_counter()
 
     try:
@@ -114,38 +120,25 @@ def resilient_weather(
         }
 
     except ValueError as exc:
-        # Invalid input isn't counted as an API failure.
-        raise HTTPException(
-            status_code=400,
-            detail=str(exc),
-        ) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    except (
-        TimeoutError,
-        ConnectionError,
-        SimulatedAPIError,
-    ) as exc:
+    except (TimeoutError, ConnectionError, SimulatedAPIError) as exc:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
-        health_monitor.record_failure(
-            "weather",
-            elapsed_ms,
-            str(exc),
-        )
+        health_monitor.record_failure("weather", elapsed_ms, str(exc))
 
         raise HTTPException(
             status_code=503,
             detail=f"Weather API failed after retries: {exc}",
         ) from exc
 
+
 @app.get("/api/v1/monitor/health")
 def get_weather_health():
-    """Return health statistics for the weather API."""
     return health_monitor.get_service_health("weather")
 
 
 @app.get("/api/v1/monitor/incidents")
 def get_weather_incidents():
-    """Return recent weather API incidents."""
     incidents = health_monitor.get_recent_incidents()
 
     return {
@@ -154,12 +147,12 @@ def get_weather_incidents():
         "incidents": incidents,
     }
 
+
 @app.post("/api/v1/analyze/changes")
 def analyze_api_changes(
     baseline: dict[str, Any],
     current: dict[str, Any],
 ):
-    """Compare two API responses and return a risk analysis."""
     detection_result = detect_changes(baseline, current)
     return analyze_changes(detection_result)
 
@@ -182,3 +175,22 @@ def integration_change_analysis(
         severity_counts=analysis["severity_counts"],
         changes=analysis["changes"],
     )
+
+
+@app.post("/api/v1/ai/analyze")
+def analyze_with_ai(payload: AIAnalyzeRequest):
+    """Run unified API change detection and the gated repair workflow."""
+    try:
+        return run_change_workflow(
+            baseline=payload.baseline,
+            current=payload.current,
+            behavior_report=payload.behavior_report,
+            text_diff=payload.text_diff,
+            pagination_reports=payload.pagination_reports,
+            rate_limit_reports=payload.rate_limit_reports,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="AI analysis is temporarily unavailable.",
+        ) from exc
