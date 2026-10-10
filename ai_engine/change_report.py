@@ -10,11 +10,11 @@ def build_unified_change_report(
     rate_limit_reports: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Combine schema, behavior, Myers diff, pagination, and rate-limit
+    Combine structural, behavioral, text-diff, pagination, and rate-limit
     evidence into one report.
 
-    Only verified, classified changes are added as confirmed findings.
-    All supplied detector reports remain available in evidence.
+    Only classified changes are added as findings.
+    Successful traversal metrics remain evidence, not change findings.
     """
     pagination_reports = pagination_reports or []
     rate_limit_reports = rate_limit_reports or []
@@ -46,8 +46,6 @@ def build_unified_change_report(
         source: str,
     ) -> None:
         for report in reports:
-            # Unverified observations are retained as evidence, but they
-            # must not be promoted to confirmed changes.
             if report.get("status") != "CHANGED":
                 continue
 
@@ -60,6 +58,40 @@ def build_unified_change_report(
 
     add_check_findings(pagination_reports, "pagination")
     add_check_findings(rate_limit_reports, "rate_limit")
+
+    # Summarize observed traversal results without treating success
+    # as a change or assuming that the production baseline is verified.
+    completed_runs = [
+        report.get("traversal", report)
+        for report in pagination_reports
+        if report.get("traversal", report).get("status") == "COMPLETED"
+    ]
+
+    failed_runs = [
+        report.get("traversal", report)
+        for report in pagination_reports
+        if report.get("traversal", report).get("status")
+        in {
+            "REQUEST_FAILED",
+            "INVALID_RESPONSE",
+            "PAGINATION_ERROR",
+            "MAX_PAGES_REACHED",
+        }
+    ]
+
+    pagination_metrics = {
+        "runs": len(pagination_reports),
+        "completed_runs": len(completed_runs),
+        "failed_or_incomplete_runs": len(failed_runs),
+        "total_pages_fetched": sum(
+            report.get("pages_fetched", 0)
+            for report in completed_runs + failed_runs
+        ),
+        "total_items_fetched": sum(
+            report.get("total_items", 0)
+            for report in completed_runs + failed_runs
+        ),
+    }
 
     summary = {
         "structural_changes": sum(
@@ -86,6 +118,7 @@ def build_unified_change_report(
             "breaking_change_count", 0
         ),
         "summary": summary,
+        "pagination_metrics": pagination_metrics,
         "changes": changes,
         "evidence": {
             "schema_report": schema_report,
