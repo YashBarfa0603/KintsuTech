@@ -1,0 +1,30 @@
+
+[
+  {
+    "id": "INC-001",
+    "title": "API response field renamed",
+    "change": "The temperature field was removed and temp_c was added.",
+    "symptoms": "Clients expecting the temperature field may fail.",
+    "root_cause": "The provider changed its response schema.",
+    "verified_repair": "After confirming field semantics and units, use a compatibility adapter to expose the expected field to older clients.",
+    "verification": "Test the adapter against documented units and representative old and new API responses."
+  },
+  {
+    "id": "INC-002",
+    "title": "Authentication header changed",
+    "change": "The API stopped accepting the previous authentication header.",
+    "symptoms": "Requests that previously succeeded return unauthorized responses.",
+    "root_cause": "The provider changed its authentication contract.",
+    "verified_repair": "Update the authentication adapter only after confirming the new header format in official provider documentation.",
+    "verification": "Test successful authentication and rejection of invalid credentials."
+  },
+  {
+    "id": "INC-003",
+    "title": "API response type changed",
+    "change": "A numeric response field changed from a number to a string.",
+    "symptoms": "Clients performing arithmetic on the field may fail.",
+    "root_cause": "The response type no longer matches the expected schema.",
+    "verified_repair": "Add validated type conversion only after confirming the new format and allowed values.",
+    "verification": "Test valid values, malformed strings, missing fields, and boundary cases."
+  }
+]
