@@ -68,3 +68,90 @@ def test_resilience_endpoint_invalid_mode():
     response = client.get("/api/v1/resilience/weather?mode=invalid")
 
     assert response.status_code == 400
+
+
+def test_monitor_health_endpoint():
+    # Record a successful weather API call.
+    success = client.get("/api/v1/resilience/weather?mode=success")
+    assert success.status_code == 200
+
+    response = client.get("/api/v1/monitor/health")
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["service"] == "weather"
+    assert data["total_calls"] >= 1
+    assert data["successful_calls"] >= 1
+    assert "failure_rate_percent" in data
+    assert "average_response_time_ms" in data
+
+
+def test_monitor_incidents_endpoint():
+    # Trigger a simulated failure to create an incident.
+    failure = client.get(
+        "/api/v1/resilience/weather?mode=timeout&max_attempts=1"
+    )
+    assert failure.status_code == 503
+
+    response = client.get("/api/v1/monitor/incidents")
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["service"] == "weather"
+    assert data["incident_count"] >= 1
+    assert len(data["incidents"]) >= 1
+    assert data["incidents"][0]["error"]
+    assert data["incidents"][0]["timestamp"]
+
+
+def test_analyze_changes_endpoint():
+    response = client.post(
+        "/api/v1/analyze/changes",
+        json={
+            "baseline": {
+                "city": "Indore",
+                "temperature": 30,
+                "condition": "Sunny",
+            },
+            "current": {
+                "city": "Indore",
+                "temperature": "30",
+                "condition": "Sunny",
+                "humidity": 45,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["has_changes"] is True
+    assert data["overall_risk"] == "high"
+    assert data["change_count"] == 2
+    assert data["severity_counts"]["high"] == 1
+    assert data["severity_counts"]["low"] == 1
+
+
+def test_analyze_changes_endpoint_no_changes():
+    response = client.post(
+        "/api/v1/analyze/changes",
+        json={
+            "baseline": {
+                "city": "Indore",
+                "temperature": 30,
+            },
+            "current": {
+                "city": "Indore",
+                "temperature": 30,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["has_changes"] is False
+    assert data["overall_risk"] == "none"
+    assert data["change_count"] == 0
