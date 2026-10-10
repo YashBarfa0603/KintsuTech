@@ -1,9 +1,10 @@
 import time
-
+from app.change_analyzer import analyze_changes
+from app.change_detector import detect_changes
 from app.health_monitor import APIHealthMonitor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
+from typing import Any
 from app.mock_apis import (
     SimulatedAPIError,
     call_weather_api,
@@ -150,3 +151,12 @@ def get_weather_incidents():
         "incident_count": len(incidents),
         "incidents": incidents,
     }
+
+@app.post("/api/v1/analyze/changes")
+def analyze_api_changes(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+):
+    """Compare two API responses and return a risk analysis."""
+    detection_result = detect_changes(baseline, current)
+    return analyze_changes(detection_result)

@@ -104,3 +104,54 @@ def test_monitor_incidents_endpoint():
     assert len(data["incidents"]) >= 1
     assert data["incidents"][0]["error"]
     assert data["incidents"][0]["timestamp"]
+
+
+def test_analyze_changes_endpoint():
+    response = client.post(
+        "/api/v1/analyze/changes",
+        json={
+            "baseline": {
+                "city": "Indore",
+                "temperature": 30,
+                "condition": "Sunny",
+            },
+            "current": {
+                "city": "Indore",
+                "temperature": "30",
+                "condition": "Sunny",
+                "humidity": 45,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["has_changes"] is True
+    assert data["overall_risk"] == "high"
+    assert data["change_count"] == 2
+    assert data["severity_counts"]["high"] == 1
+    assert data["severity_counts"]["low"] == 1
+
+
+def test_analyze_changes_endpoint_no_changes():
+    response = client.post(
+        "/api/v1/analyze/changes",
+        json={
+            "baseline": {
+                "city": "Indore",
+                "temperature": 30,
+            },
+            "current": {
+                "city": "Indore",
+                "temperature": 30,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+
+    assert data["has_changes"] is False
+    assert data["overall_risk"] == "none"
+    assert data["change_count"] == 0
