@@ -11,9 +11,10 @@ if str(BACKEND_PATH) not in sys.path:
     sys.path.insert(0, str(BACKEND_PATH))
 
 from app.change_detector import detect_changes
-from change_report import build_unified_change_report
-from repair_pipeline import run_repair_pipeline
 from behavior_runner import run_behavior_suite
+from change_report import build_unified_change_report
+from controlled_behavior_checks import run_controlled_behavior_checks
+from repair_pipeline import run_repair_pipeline
 
 
 def run_change_workflow(
@@ -69,13 +70,32 @@ def run_change_workflow(
             "suite_evidence": suite_report,
         }
 
+    # Stage 2b: Run specialized checks against the controlled API.
+    if run_behavior_tests:
+        controlled_reports = run_controlled_behavior_checks()
+    else:
+        controlled_reports = {
+            "pagination_reports": [],
+            "rate_limit_reports": [],
+        }
+
+    pagination_reports = (
+        (pagination_reports or [])
+        + controlled_reports["pagination_reports"]
+    )
+
+    rate_limit_reports = (
+        (rate_limit_reports or [])
+        + controlled_reports["rate_limit_reports"]
+    )
+
     # Stage 3: Assemble evidence from all available detectors.
     unified_report = build_unified_change_report(
         schema_report=schema_report,
         behavior_report=behavior_report or {"changes": []},
         text_diff=text_diff or [],
-        pagination_reports=pagination_reports or [],
-        rate_limit_reports=rate_limit_reports or [],
+        pagination_reports=pagination_reports,
+        rate_limit_reports=rate_limit_reports,
     )
 
     # Stage 4: Skip repair analysis only when no findings were detected.
