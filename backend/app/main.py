@@ -1,4 +1,6 @@
+import time
 
+from app.health_monitor import APIHealthMonitor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -28,6 +30,7 @@ app.add_middleware(
 )
 
 observer = APIObserver()
+health_monitor = APIHealthMonitor()
 
 
 @app.get("/api/v1/health")
@@ -83,17 +86,23 @@ def reset_weather_observation():
     }
 
 
+
 @app.get("/api/v1/resilience/weather")
 def resilient_weather(
     mode: str = "success",
     max_attempts: int = 3,
 ):
-    """Call the simulated weather API with bounded retries."""
+    """Call the simulated weather API with retries and track health."""
+    start_time = time.perf_counter()
+
     try:
         response = call_with_retry(
             lambda: call_weather_api(mode),
             max_attempts=max_attempts,
         )
+
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        health_monitor.record_success("weather", elapsed_ms)
 
         return {
             "status": "success",
@@ -102,6 +111,7 @@ def resilient_weather(
         }
 
     except ValueError as exc:
+        # Invalid input isn't counted as an API failure.
         raise HTTPException(
             status_code=400,
             detail=str(exc),
@@ -112,7 +122,31 @@ def resilient_weather(
         ConnectionError,
         SimulatedAPIError,
     ) as exc:
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        health_monitor.record_failure(
+            "weather",
+            elapsed_ms,
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=503,
             detail=f"Weather API failed after retries: {exc}",
         ) from exc
+
+@app.get("/api/v1/monitor/health")
+def get_weather_health():
+    """Return health statistics for the weather API."""
+    return health_monitor.get_service_health("weather")
+
+
+@app.get("/api/v1/monitor/incidents")
+def get_weather_incidents():
+    """Return recent weather API incidents."""
+    incidents = health_monitor.get_recent_incidents()
+
+    return {
+        "service": "weather",
+        "incident_count": len(incidents),
+        "incidents": incidents,
+    }
