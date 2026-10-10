@@ -233,3 +233,35 @@ def test_analyze_changes_endpoint_no_changes():
     assert data["has_changes"] is False
     assert data["overall_risk"] == "none"
     assert data["change_count"] == 0
+
+def test_ai_adapter_endpoint_returns_expected_contract():
+    from unittest.mock import patch
+
+    with patch(
+        "app.main.analyze_with_adapter",
+        return_value={
+            "summary": "Detected 1 API change finding(s).",
+            "risk_level": "high",
+            "recommendations": ["Review affected consumers."],
+            "repair_proposal": {
+                "validation_status": "pending_review",
+                "eligible_for_activation": False,
+            },
+        },
+    ) as mocked_adapter:
+        response = client.post(
+            "/api/v1/analyze/changes/ai",
+            json={
+                "baseline": {"temperature": 30},
+                "current": {"temp_c": 30},
+            },
+        )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["risk_level"] == "high"
+    assert data["recommendations"]
+    assert data["repair_proposal"]["eligible_for_activation"] is False
+
+    mocked_adapter.assert_called_once()

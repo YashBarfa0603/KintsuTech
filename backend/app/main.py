@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.change_analyzer import analyze_changes
+from app.ai_adapter import analyze_changes as analyze_with_adapter
 from app.change_detector import detect_changes
 from app.health_monitor import APIHealthMonitor
 from app.mock_apis import (
@@ -155,6 +156,26 @@ def analyze_api_changes(
     detection_result = detect_changes(baseline, current)
     return analyze_changes(detection_result)
 
+@app.post("/api/v1/analyze/changes/ai")
+def analyze_api_changes_with_ai(
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+):
+    """Analyze API changes using the AI adapter."""
+    try:
+        detection_result = detect_changes(baseline, current)
+
+        return analyze_with_adapter(
+            service="weather",
+            baseline=baseline,
+            current=current,
+            detected_changes=detection_result,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="AI change analysis is temporarily unavailable.",
+        ) from exc
 
 @app.post("/api/v1/ai/analyze")
 def analyze_with_ai(payload: AIAnalyzeRequest):
