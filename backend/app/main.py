@@ -1,6 +1,8 @@
 import time
-from app.change_analyzer import analyze_changes
+
+from app.integration_schemas import ChangeAnalysisRequest, ChangeAnalysisResponse
 from app.change_detector import detect_changes
+from app.change_analyzer import analyze_changes
 from app.health_monitor import APIHealthMonitor
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -160,3 +162,23 @@ def analyze_api_changes(
     """Compare two API responses and return a risk analysis."""
     detection_result = detect_changes(baseline, current)
     return analyze_changes(detection_result)
+
+
+@app.post(
+    "/api/v1/integrations/change-analysis",
+    response_model=ChangeAnalysisResponse,
+)
+def integration_change_analysis(
+    request: ChangeAnalysisRequest,
+) -> ChangeAnalysisResponse:
+    detection = detect_changes(request.baseline, request.current)
+    analysis = analyze_changes(detection)
+
+    return ChangeAnalysisResponse(
+        service=request.service,
+        has_changes=analysis["has_changes"],
+        overall_risk=analysis["overall_risk"],
+        change_count=analysis["change_count"],
+        severity_counts=analysis["severity_counts"],
+        changes=analysis["changes"],
+    )
