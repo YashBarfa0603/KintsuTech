@@ -1,3 +1,4 @@
+from app.ai_adapter import AIAdapter
 import sys
 import time
 from pathlib import Path
@@ -45,6 +46,7 @@ app = FastAPI(
     description="API change detection and resilience monitoring.",
     version="0.1.0",
 )
+ai_adapter = AIAdapter(run_change_workflow)
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,6 +177,9 @@ def integration_change_analysis(
         severity_counts=analysis["severity_counts"],
         changes=analysis["changes"],
     )
+
+
+
 
 
 @app.post("/api/v1/ai/analyze")
