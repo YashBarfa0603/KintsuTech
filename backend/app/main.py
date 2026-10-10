@@ -1,4 +1,3 @@
-from app.ai_adapter import AIAdapter
 import sys
 import time
 from pathlib import Path
@@ -8,8 +7,9 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from app.change_analyzer import analyze_changes
+from app.ai_adapter import AIAdapter
 from app.ai_adapter import analyze_changes as analyze_with_adapter
+from app.change_analyzer import analyze_changes
 from app.change_detector import detect_changes
 from app.health_monitor import APIHealthMonitor
 from app.integration_schemas import ChangeAnalysisRequest, ChangeAnalysisResponse
@@ -40,6 +40,7 @@ class AIAnalyzeRequest(BaseModel):
     text_diff: list[dict[str, str]] | None = None
     pagination_reports: list[dict[str, Any]] | None = None
     rate_limit_reports: list[dict[str, Any]] | None = None
+    run_behavior_tests: bool = False
 
 
 app = FastAPI(
@@ -47,6 +48,7 @@ app = FastAPI(
     description="API change detection and resilience monitoring.",
     version="0.1.0",
 )
+
 ai_adapter = AIAdapter(run_change_workflow)
 
 app.add_middleware(
@@ -159,6 +161,7 @@ def analyze_api_changes(
     detection_result = detect_changes(baseline, current)
     return analyze_changes(detection_result)
 
+
 @app.post("/api/v1/analyze/changes/ai")
 def analyze_api_changes_with_ai(
     baseline: dict[str, Any],
@@ -180,6 +183,7 @@ def analyze_api_changes_with_ai(
             detail="AI change analysis is temporarily unavailable.",
         ) from exc
 
+
 @app.post(
     "/api/v1/integrations/change-analysis",
     response_model=ChangeAnalysisResponse,
@@ -200,9 +204,6 @@ def integration_change_analysis(
     )
 
 
-
-
-
 @app.post("/api/v1/ai/analyze")
 def analyze_with_ai(payload: AIAnalyzeRequest):
     """Run unified API change detection and the gated repair workflow."""
@@ -214,6 +215,7 @@ def analyze_with_ai(payload: AIAnalyzeRequest):
             text_diff=payload.text_diff,
             pagination_reports=payload.pagination_reports,
             rate_limit_reports=payload.rate_limit_reports,
+            run_behavior_tests=payload.run_behavior_tests,
         )
     except Exception as exc:
         raise HTTPException(

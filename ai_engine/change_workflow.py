@@ -13,6 +13,7 @@ if str(BACKEND_PATH) not in sys.path:
 from app.change_detector import detect_changes
 from change_report import build_unified_change_report
 from repair_pipeline import run_repair_pipeline
+from behavior_runner import run_behavior_suite
 
 
 def run_change_workflow(
@@ -24,8 +25,9 @@ def run_change_workflow(
     text_diff: list[dict[str, str]] | None = None,
     pagination_reports: list[dict[str, Any]] | None = None,
     rate_limit_reports: list[dict[str, Any]] | None = None,
+    run_behavior_tests: bool = False,
 ) -> dict[str, Any]:
-    """Detect changes, build one report, and invoke the gated repair pipeline."""
+    """Detect changes, assemble evidence, and invoke the gated repair pipeline."""
 
     # Stage 1: Detect structural changes deterministically.
     schema_report = detect_changes(
@@ -33,7 +35,41 @@ def run_change_workflow(
         current=current,
     )
 
-    # Stage 2: Assemble evidence from all available detectors.
+    # Stage 2: Optionally run behavioral tests against a configured API.
+    if run_behavior_tests:
+        suite_report = run_behavior_suite()
+
+        existing_behavior_report = (
+            behavior_report if isinstance(behavior_report, dict) else {}
+        )
+        existing_changes = existing_behavior_report.get("changes", [])
+
+        if not isinstance(existing_changes, list):
+            existing_changes = []
+
+        confirmed_changes = []
+
+        for result in suite_report.get("results", []):
+            if (
+                result.get("status") == "CHANGED"
+                and result.get("baseline_status") == "verified"
+            ):
+                confirmed_changes.append(
+                    {
+                        "kind": "behavior_case_changed",
+                        "case_id": result.get("case_id"),
+                        "name": result.get("name"),
+                        "differences": result.get("differences", []),
+                    }
+                )
+
+        behavior_report = {
+            **existing_behavior_report,
+            "changes": existing_changes + confirmed_changes,
+            "suite_evidence": suite_report,
+        }
+
+    # Stage 3: Assemble evidence from all available detectors.
     unified_report = build_unified_change_report(
         schema_report=schema_report,
         behavior_report=behavior_report or {"changes": []},
@@ -42,7 +78,7 @@ def run_change_workflow(
         rate_limit_reports=rate_limit_reports or [],
     )
 
-    # Stage 3: Skip repair analysis only when no findings were detected.
+    # Stage 4: Skip repair analysis only when no findings were detected.
     if not unified_report["has_changes"]:
         return {
             "change_report": unified_report,
@@ -53,7 +89,7 @@ def run_change_workflow(
             },
         }
 
-    # Stage 4: Send the unified report to the existing repair pipeline.
+    # Stage 5: Send the unified report to the existing gated repair pipeline.
     pipeline_result = run_repair_pipeline(
         baseline=baseline,
         current=current,

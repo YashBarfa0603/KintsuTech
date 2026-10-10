@@ -44,6 +44,7 @@ def test_ai_analyze_endpoint_calls_workflow():
     assert response.status_code == 200
     assert response.json() == expected_result
 
+    
     mocked_workflow.assert_called_once_with(
         baseline={"temperature": 30},
         current={"temp_c": 30},
@@ -51,6 +52,7 @@ def test_ai_analyze_endpoint_calls_workflow():
         text_diff=None,
         pagination_reports=None,
         rate_limit_reports=None,
+        run_behavior_tests=False,
     )
 
 
