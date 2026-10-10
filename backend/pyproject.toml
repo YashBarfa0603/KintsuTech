@@ -1,0 +1,28 @@
+[project]
+name = "KintsuTech"
+version = "0.1.0"
+description = "Autonomous API Resilience Platform"
+readme = "README.md"
+authors = [
+    { name = "YashBarfa0603", email = "yashbarfa67@gmail.com" }
+]
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.128.8",
+    "httpx>=0.28.1",
+    "networkx>=3.2.1",
+    "pydantic>=2.13.5",
+    "sqlalchemy>=2.0.54",
+    "uvicorn[standard]>=0.39.0",
+]
+
+[project.scripts]
+backend = "backend:main"
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.2",
+]
