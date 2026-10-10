@@ -10,18 +10,19 @@ def run_repair_pipeline(
     current: dict[str, Any],
     reviewed_adapter: dict[str, Any] | None = None,
     test_cases: list[dict[str, Any]] | None = None,
+    change_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Run AI analysis followed by deterministic repair validation.
+    Run AI reasoning followed by deterministic repair validation.
 
-    reviewed_adapter must be independently reviewed.
-    The AI proposal cannot confirm its own field semantics.
+    The model cannot independently confirm field semantics.
     """
 
-    # Stage 1: AI analysis with historical incident retrieval.
+    # Stage 1: Analyze the API change using detector findings and RAG.
     proposal = analyze_api_change(
         baseline=baseline,
         current=current,
+        change_report=change_report,
     )
 
     result = {
@@ -35,7 +36,7 @@ def run_repair_pipeline(
         },
     }
 
-    # Stage 2: Never infer an executable adapter from AI prose.
+    # Stage 2: Require independent review.
     if reviewed_adapter is None:
         result["validation"]["errors"] = [
             "An independently reviewed adapter configuration is required.",
@@ -43,14 +44,14 @@ def run_repair_pipeline(
         ]
         return result
 
-    # Stage 3: Require test cases supplied independently of the LLM.
+    # Stage 3: Require independently supplied test cases.
     if test_cases is None:
         result["validation"]["errors"] = [
             "Independent regression test cases are required."
         ]
         return result
 
-    # Stage 4: Deterministic validation.
+    # Stage 4: Validate the restricted adapter operation.
     validation = validate_repair(
         proposal=reviewed_adapter,
         test_cases=test_cases,
@@ -69,16 +70,21 @@ def run_repair_pipeline(
 
 
 if __name__ == "__main__":
+    import json
+
     baseline = {"temperature": 28}
     current = {"temp_c": 28}
 
-    # No reviewed adapter is supplied, so the pipeline must
-    # keep the repair pending rather than trusting the LLM.
     output = run_repair_pipeline(
         baseline=baseline,
         current=current,
+        change_report={
+            "has_changes": True,
+            "changes": [
+                {"type": "field_removed", "path": "temperature"},
+                {"type": "field_added", "path": "temp_c"},
+            ],
+        },
     )
-
-    import json
 
     print(json.dumps(output, indent=2))
