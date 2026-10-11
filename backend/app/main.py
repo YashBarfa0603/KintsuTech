@@ -6,9 +6,24 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from app.auth import (
+    AuthenticatedUser,
+    get_current_user,
+    get_optional_current_user,
+    verify_supabase_token,
+    SUPABASE_URL,
+    SUPABASE_JWT_SECRET,
+)
+from app.auth_schemas import (
+    AuthHealthResponse,
+    TokenVerifyRequest,
+    TokenVerifyResponse,
+    UserProfileResponse,
+)
 
 from app.ai_adapter import AIAdapter
 from app.ai_adapter import analyze_changes as analyze_with_adapter
@@ -601,17 +616,183 @@ def validate_repair_proposal(payload: RepairValidationRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# ============================================================================
+# Supabase Authentication Endpoints
+# ============================================================================
+
+
+@app.get("/api/v1/auth/health", response_model=AuthHealthResponse)
+def get_auth_health():
+    """Report backend Supabase authentication status and configuration without leaking secrets."""
+    return AuthHealthResponse(
+        status="healthy",
+        auth_provider="supabase",
+        supabase_configured=bool(SUPABASE_URL),
+        jwks_enabled=bool(SUPABASE_URL),
+        jwt_secret_configured=bool(SUPABASE_JWT_SECRET),
+        protected_endpoints=[
+            "/api/v1/auth/me",
+            "/api/v1/repairs/activate",
+            "/api/v1/repairs/rollback",
+        ],
+    )
+
+
+@app.get("/api/v1/auth/me", response_model=UserProfileResponse)
+def get_current_user_profile(current_user: AuthenticatedUser = Depends(get_current_user)):
+    """
+    Retrieve verified profile of the currently authenticated Supabase user
+    and automatically save/update the user record in the local SQLite database.
+    """
+    storage_registry.sync_user(
+        user_id=current_user.id,
+        email=current_user.email,
+        full_name=current_user.user_metadata.get("full_name") or current_user.display_name,
+        role=current_user.role,
+        user_metadata=current_user.user_metadata,
+    )
+    return UserProfileResponse(
+        id=current_user.id,
+        email=current_user.email,
+        phone=current_user.phone,
+        role=current_user.role,
+        display_name=current_user.display_name,
+        user_metadata=current_user.user_metadata,
+        app_metadata=current_user.app_metadata,
+    )
+
+
+@app.post("/api/v1/auth/verify", response_model=TokenVerifyResponse)
+def verify_token_endpoint(
+    request: Request,
+    payload: TokenVerifyRequest | None = None,
+):
+    """
+    Verify the supplied Supabase access token (via Bearer header or request body),
+    save user identity into local SQLite database, and return safe identity information.
+    Rejects missing, expired, or invalid tokens with HTTP 401.
+    """
+    token = None
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ", 1)[1].strip()
+    elif payload and payload.token:
+        token = payload.token
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing access token in Authorization header or body.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = verify_supabase_token(token)
+    storage_registry.sync_user(
+        user_id=user.id,
+        email=user.email,
+        full_name=user.user_metadata.get("full_name") or user.display_name,
+        role=user.role,
+        user_metadata=user.user_metadata,
+    )
+    return TokenVerifyResponse(
+        valid=True,
+        user=UserProfileResponse(
+            id=user.id,
+            email=user.email,
+            phone=user.phone,
+            role=user.role,
+            display_name=user.display_name,
+            user_metadata=user.user_metadata,
+            app_metadata=user.app_metadata,
+        ),
+        error=None,
+    )
+
+
+class UserProfileSyncRequest(BaseModel):
+    full_name: str | None = None
+    email: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@app.post("/api/v1/auth/sync", response_model=UserProfileResponse)
+def sync_user_profile(
+    payload: UserProfileSyncRequest | None = None,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Explicit endpoint for frontend to persist or update signup/login user fields into SQLite database.
+    """
+    meta = dict(current_user.user_metadata)
+    if payload and payload.metadata:
+        meta.update(payload.metadata)
+
+    full_name = (
+        (payload.full_name if payload and payload.full_name else None)
+        or current_user.user_metadata.get("full_name")
+        or current_user.display_name
+    )
+    email = (payload.email if payload and payload.email else None) or current_user.email
+
+    saved_user = storage_registry.sync_user(
+        user_id=current_user.id,
+        email=email,
+        full_name=full_name,
+        role=current_user.role,
+        user_metadata=meta,
+    )
+
+    return UserProfileResponse(
+        id=saved_user["id"],
+        email=saved_user["email"],
+        phone=current_user.phone,
+        role=saved_user["role"],
+        display_name=saved_user["full_name"] or current_user.display_name,
+        user_metadata=saved_user["user_metadata"],
+        app_metadata=current_user.app_metadata,
+    )
+
+
+@app.get("/api/v1/users")
+def list_local_users():
+    """List all registered users stored in the local SQLite database."""
+    return {"users": storage_registry.list_users()}
+
+
+@app.post("/api/v1/auth/logout")
+def logout_endpoint(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Backend logout verification endpoint.
+    Note: Supabase access tokens are stateless JWTs.
+    Client-side session termination is performed by calling supabase.auth.signOut(),
+    which deletes the local session and revokes the refresh token on the Supabase Auth server.
+    """
+    return {
+        "status": "logged_out",
+        "message": "Session terminated on client. Refresh token revoked via Supabase Auth.",
+        "user_id": current_user.id,
+    }
+
+
+
+
 @app.post("/api/v1/repairs/activate")
-def activate_repair(payload: RepairActivationRequest):
+def activate_repair(
+    payload: RepairActivationRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
     """
     Guarded repair activation.
-    Rejected if the proposal has not passed independent validation.
+    Rejected if caller is unauthenticated or the proposal has not passed independent validation.
     """
     try:
+        authorizer = payload.authorizer or current_user.display_name or current_user.email or current_user.id
         activation = storage_registry.activate_repair(
             payload.incident_id,
             payload.adapter,
-            authorizer=payload.authorizer,
+            authorizer=authorizer,
             note=payload.note,
         )
 
@@ -632,14 +813,18 @@ def activate_repair(payload: RepairActivationRequest):
 
 
 @app.post("/api/v1/repairs/rollback")
-def rollback_repair(payload: RepairRollbackRequest):
+def rollback_repair(
+    payload: RepairRollbackRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
     """
     Deactivate active adapter and restore service to un-adapted baseline state.
     """
     try:
+        authorizer = payload.authorizer or current_user.display_name or current_user.email or current_user.id
         rollback = storage_registry.rollback_repair(
             payload.service_id,
-            authorizer=payload.authorizer,
+            authorizer=authorizer,
             reason=payload.reason,
         )
 
@@ -656,6 +841,7 @@ def rollback_repair(payload: RepairRollbackRequest):
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 
 @app.get("/api/v1/repairs/audit")

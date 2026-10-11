@@ -102,6 +102,18 @@ class AuditLogModel(Base):
     timestamp = Column(String(50), nullable=False)
 
 
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id = Column(String(100), primary_key=True)
+    email = Column(String(255), nullable=True, index=True)
+    full_name = Column(String(255), nullable=True)
+    role = Column(String(50), default="authenticated")
+    user_metadata_json = Column(Text, default="{}")
+    created_at = Column(String(50), nullable=False)
+    updated_at = Column(String(50), nullable=False)
+
+
 # Default persistent file location outside source code
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_DB_FILE = DEFAULT_DATA_DIR / "kintsutech.db"
@@ -706,6 +718,100 @@ class StorageRegistry:
                 rows = session.scalars(select(AuditLogModel).order_by(AuditLogModel.id.desc())).all()
                 return [json.loads(r.payload_json) for r in rows]
 
+    def sync_user(
+        self,
+        user_id: str,
+        email: str | None = None,
+        full_name: str | None = None,
+        role: str = "authenticated",
+        user_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Persist or update an authenticated user profile in the local SQLite database.
+        Returns the saved user record.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        metadata_clean = user_metadata or {}
+        metadata_str = json.dumps(metadata_clean)
+
+        with self._lock:
+            with self._get_session() as session:
+                existing = session.get(UserModel, user_id)
+                if existing:
+                    if email is not None:
+                        existing.email = email
+                    if full_name is not None:
+                        existing.full_name = full_name
+                    existing.role = role
+                    existing.user_metadata_json = metadata_str
+                    existing.updated_at = now
+                    session.commit()
+                    return {
+                        "id": existing.id,
+                        "email": existing.email,
+                        "full_name": existing.full_name,
+                        "role": existing.role,
+                        "user_metadata": json.loads(existing.user_metadata_json),
+                        "created_at": existing.created_at,
+                        "updated_at": existing.updated_at,
+                    }
+                else:
+                    new_user = UserModel(
+                        id=user_id,
+                        email=email,
+                        full_name=full_name,
+                        role=role,
+                        user_metadata_json=metadata_str,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(new_user)
+                    session.commit()
+                    return {
+                        "id": new_user.id,
+                        "email": new_user.email,
+                        "full_name": new_user.full_name,
+                        "role": new_user.role,
+                        "user_metadata": metadata_clean,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+
+    def get_user(self, user_id: str) -> dict[str, Any] | None:
+        """Retrieve a user by ID from the local SQLite database."""
+        with self._lock:
+            with self._get_session() as session:
+                user = session.get(UserModel, user_id)
+                if not user:
+                    return None
+                return {
+                    "id": user.id,
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "role": user.role,
+                    "user_metadata": json.loads(user.user_metadata_json),
+                    "created_at": user.created_at,
+                    "updated_at": user.updated_at,
+                }
+
+    def list_users(self) -> list[dict[str, Any]]:
+        """List all users saved in the local SQLite database."""
+        with self._lock:
+            with self._get_session() as session:
+                users = session.scalars(select(UserModel).order_by(UserModel.created_at.desc())).all()
+                return [
+                    {
+                        "id": u.id,
+                        "email": u.email,
+                        "full_name": u.full_name,
+                        "role": u.role,
+                        "user_metadata": json.loads(u.user_metadata_json),
+                        "created_at": u.created_at,
+                        "updated_at": u.updated_at,
+                    }
+                    for u in users
+                ]
+
     def reset(self) -> None:
         """Utility to wipe all storage tables (useful for isolated tests)."""
         with self._lock:
@@ -716,7 +822,9 @@ class StorageRegistry:
                 session.execute(delete(BaselineModel))
                 session.execute(delete(ServiceModel))
                 session.execute(delete(AuditLogModel))
+                session.execute(delete(UserModel))
                 session.commit()
+
 
 
 # Singleton instance for backend use
