@@ -35,6 +35,7 @@ if str(AI_ENGINE_PATH) not in sys.path:
     sys.path.insert(0, str(AI_ENGINE_PATH))
 
 from change_workflow import run_change_workflow
+from consumer_contracts import contract_registry
 from repair_validator import validate_repair
 
 from app.dependency_graph import create_default_dependency_graph
@@ -80,6 +81,9 @@ class RepairValidationRequest(BaseModel):
     incident_id: str
     adapter: dict[str, Any]
     test_cases: list[dict[str, Any]]
+    consumer_contracts: list[dict[str, Any]] | None = None
+    service_id: str | None = None
+    required_consumers: list[str] | None = None
 
 
 class RepairActivationRequest(BaseModel):
@@ -87,6 +91,16 @@ class RepairActivationRequest(BaseModel):
     adapter: dict[str, Any]
     authorizer: str = "human_operator"
     note: str = ""
+    contract_version: str | None = None
+
+
+class ConsumerContractRequest(BaseModel):
+    consumer_id: str
+    service_id: str
+    version: str = "1.0"
+    mandatory: bool = True
+    fields: dict[str, Any]
+    description: str = ""
 
 
 class RepairRollbackRequest(BaseModel):
@@ -259,37 +273,24 @@ def apply_compatibility_adapter(
     response: dict[str, Any],
     adapter_config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Apply a supported field-copy adapter without mutating the input."""
-    if adapter_config.get("operation") != "copy_field":
+    """Apply a supported compatibility adapter (copy_field or convert_units) without mutating input."""
+    operation = adapter_config.get("operation")
+    if operation not in ("copy_field", "convert_units"):
         raise HTTPException(
             status_code=400,
             detail="Unsupported adapter operation.",
         )
 
-    source_field = adapter_config.get("source_field")
-    target_field = adapter_config.get("target_field")
-
-    if not isinstance(source_field, str) or not source_field:
-        raise HTTPException(status_code=400, detail="Invalid source_field.")
-
-    if not isinstance(target_field, str) or not target_field:
-        raise HTTPException(status_code=400, detail="Invalid target_field.")
-
-    if source_field not in response:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Adapter source field '{source_field}' is missing.",
-        )
-
-    if target_field in response and target_field != source_field:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Adapter target field '{target_field}' already exists.",
-        )
-
-    adapted = dict(response)
-    adapted[target_field] = adapted[source_field]
-    return adapted
+    try:
+        from repair_validator import apply_compatibility_adapter as ai_apply_adapter
+        return ai_apply_adapter(response, adapter_config=adapter_config)
+    except ValueError as exc:
+        msg = str(exc)
+        if "already exists" in msg:
+            raise HTTPException(status_code=409, detail=msg) from exc
+        if "is missing" in msg or "cannot be null" in msg or "must be a finite number" in msg or "below required" in msg or "exceeds required" in msg:
+            raise HTTPException(status_code=422, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
 
 
 @app.post("/api/v1/compatible/weather")
@@ -605,31 +606,43 @@ def get_incident_by_id(incident_id: str):
 @app.post("/api/v1/repairs/validate")
 def validate_repair_proposal(payload: RepairValidationRequest):
     """
-    Deterministically validate a proposed compatibility adapter using test cases.
+    Deterministically validate a proposed compatibility adapter using test cases
+    and downstream consumer contracts.
     Does NOT activate the repair.
     """
     try:
-        validation_result = validate_repair(payload.adapter, payload.test_cases)
+        service_id = payload.service_id
+        if not service_id:
+            inc = storage_registry.get_incident(payload.incident_id)
+            if inc:
+                service_id = inc.get("service_id")
+
+        validation_result = validate_repair(
+            payload.adapter,
+            payload.test_cases,
+            consumer_contracts=payload.consumer_contracts,
+            service_id=service_id,
+            required_consumers=payload.required_consumers,
+        )
         storage_registry.record_validation(
             payload.incident_id,
             validation_result,
             adapter_config=payload.adapter,
+            contract_version=validation_result.get("contract_version"),
         )
 
         # Dispatch repair.validated webhook event upon successful validation
         if validation_result.get("eligible_for_activation") or validation_result.get("passed"):
-            service_id = "kintsutech"
-            inc = storage_registry.get_incident(payload.incident_id)
-            if inc:
-                service_id = inc.get("service_id", "kintsutech")
+            effective_service_id = service_id or "kintsutech"
             event = webhook_manager.create_event(
                 "repair.validated",
                 {
                     "incident_id": payload.incident_id,
                     "validation": validation_result,
                     "adapter": payload.adapter,
+                    "contract_version": validation_result.get("contract_version"),
                 },
-                service_id=service_id,
+                service_id=effective_service_id,
             )
             webhook_manager.dispatch_event_background(event)
 
@@ -648,7 +661,8 @@ def activate_repair(
 ):
     """
     Guarded repair activation.
-    Rejected if the proposal has not passed independent validation or adapter hash mismatch.
+    Rejected if proposal has not passed independent validation, adapter hash mismatch,
+    or contract version mismatch.
     """
     try:
         activation = storage_registry.activate_repair(
@@ -656,6 +670,7 @@ def activate_repair(
             payload.adapter,
             authorizer=payload.authorizer,
             note=payload.note,
+            contract_version=payload.contract_version,
         )
 
         # Notify subscribers asynchronously in background
@@ -670,6 +685,27 @@ def activate_repair(
             "status": "activated",
             "activation": activation,
         }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/contracts")
+def list_consumer_contracts(service_id: str | None = Query(default=None)):
+    """List registered downstream consumer contracts."""
+    if service_id:
+        return {"contracts": contract_registry.get_for_service(service_id)}
+    return {"contracts": contract_registry.list_all()}
+
+
+@app.post("/api/v1/contracts")
+def register_consumer_contract(
+    payload: ConsumerContractRequest,
+    auth_user: str = Depends(verify_api_key),
+):
+    """Register or update a downstream consumer contract."""
+    try:
+        contract = contract_registry.register(payload.model_dump())
+        return {"status": "registered", "contract": contract}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

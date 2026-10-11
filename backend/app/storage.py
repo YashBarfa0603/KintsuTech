@@ -81,6 +81,7 @@ class ValidationModel(Base):
     eligible_for_activation = Column(Boolean, nullable=False)
     tests_passed = Column(Integer, default=0)
     adapter_hash = Column(String(64), nullable=True)
+    contract_version = Column(String(50), nullable=True)
     created_at = Column(String(50), nullable=False)
 
 
@@ -219,6 +220,8 @@ class StorageRegistry:
                 existing_cols = [row[1] for row in result.fetchall()]
                 if existing_cols and "adapter_hash" not in existing_cols:
                     conn.exec_driver_sql("ALTER TABLE validations ADD COLUMN adapter_hash VARCHAR(64)")
+                if existing_cols and "contract_version" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE validations ADD COLUMN contract_version VARCHAR(50)")
             except Exception:
                 pass
 
@@ -549,6 +552,7 @@ class StorageRegistry:
         incident_id: str,
         validation_result: dict[str, Any],
         adapter_config: dict[str, Any] | None = None,
+        contract_version: str | None = None,
     ) -> dict[str, Any]:
         """Record validation outcome for an incident's proposed repair."""
         with self._lock:
@@ -571,6 +575,10 @@ class StorageRegistry:
                 if adapter_hash:
                     validation_result["adapter_hash"] = adapter_hash
 
+                resolved_contract_version = contract_version or validation_result.get("contract_version")
+                if resolved_contract_version:
+                    validation_result["contract_version"] = resolved_contract_version
+
                 val_record = session.get(ValidationModel, incident_id)
                 if not val_record:
                     val_record = ValidationModel(
@@ -579,6 +587,7 @@ class StorageRegistry:
                         eligible_for_activation=eligible,
                         tests_passed=int(validation_result.get("tests_passed", 0)),
                         adapter_hash=adapter_hash,
+                        contract_version=resolved_contract_version,
                         created_at=now_str,
                     )
                     session.add(val_record)
@@ -587,6 +596,7 @@ class StorageRegistry:
                     val_record.eligible_for_activation = eligible
                     val_record.tests_passed = int(validation_result.get("tests_passed", 0))
                     val_record.adapter_hash = adapter_hash
+                    val_record.contract_version = resolved_contract_version
 
                 audit_event = {
                     "event": "repair_validated",
@@ -595,6 +605,7 @@ class StorageRegistry:
                     "eligible": eligible,
                     "tests_passed": validation_result.get("tests_passed", 0),
                     "adapter_hash": adapter_hash,
+                    "contract_version": resolved_contract_version,
                     "timestamp": now_str,
                 }
                 session.add(
@@ -628,11 +639,13 @@ class StorageRegistry:
         *,
         authorizer: str = "system",
         note: str = "",
+        contract_version: str | None = None,
     ) -> dict[str, Any]:
         """
         Guarded repair activation.
-        Requires that the proposed adapter was verified via validation and
-        matches the exact validated adapter configuration hash.
+        Requires that the proposed adapter was verified via validation,
+        matches the exact validated adapter configuration hash,
+        and matches the validated contract version.
         """
         with self._lock:
             if not incident_id or not isinstance(incident_id, str) or not incident_id.strip():
@@ -657,6 +670,13 @@ class StorageRegistry:
                         f"Cannot activate repair for {incident_id}: "
                         f"Requested adapter configuration does not match validated adapter. "
                         f"Validated hash: '{val.adapter_hash}', requested hash: '{requested_hash}'."
+                    )
+
+                # Recheck contract version if provided
+                if contract_version and val.contract_version and val.contract_version != contract_version:
+                    raise ValueError(
+                        f"Cannot activate repair for {incident_id}: "
+                        f"Requested contract version '{contract_version}' does not match validated contract version '{val.contract_version}'."
                     )
 
                 now_str = datetime.now(timezone.utc).isoformat()

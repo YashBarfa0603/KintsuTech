@@ -263,6 +263,31 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/webhooks/subscriptions \
    - `repair.activated`: Dispatched only after authorized repair activation succeeds (never emitted if activation fails or adapter hash mismatch occurs).
    - `repair.rollback_completed`: Dispatched only after rollback completes.
 
+### Semantic Repair Validation & Consumer Contracts (Phase 5C)
+
+1. **Supported Operations**:
+   - `copy_field`: Restores renamed fields without mutating input.
+   - `convert_units`: Applies deterministic linear transformation (`output = input * scale + offset`) with explicit, finite numeric `scale` and `offset` parameters.
+
+2. **Explicit Typed Field Constraints**:
+   - Supported schema types: `string`, `integer`, `number`, `boolean`, `object`, and `array`.
+   - Strict type checking: Booleans are strictly rejected where numeric values are required. Silent coercion between strings and numbers is blocked.
+   - Required vs. optional fields and nullable vs. non-nullable values are strictly enforced.
+   - Non-finite numbers (NaN, +/- infinity) are rejected.
+
+3. **Numeric Ranges & Invariants**:
+   - Optional `minimum` and `maximum` constraints for numeric fields (e.g. humidity `[0, 100]`, Celsius temperature `>= -273.15`).
+   - Applied strictly against explicitly declared consumer contracts or service schemas (never assumed or globally guessed).
+
+4. **Downstream Consumer Contract Verification**:
+   - Independent verification against all downstream consumer contracts registered in `ConsumerContractRegistry` or supplied in the validation request.
+   - Mandatory contract failures or missing required consumer contracts immediately disqualify a repair (`eligible_for_activation = false`).
+   - Contract endpoints: `GET /api/v1/contracts` (discoverable contracts) and `POST /api/v1/contracts` (authenticated contract registration).
+
+5. **Validation Integrity & Version Binding**:
+   - Binds the complete adapter configuration hash (`adapter_hash`) and the validated `contract_version` to the `validations` table.
+   - Guarded activation requires both exact canonical adapter hash matching and contract version matching, rejecting any post-validation tampering or version drift.
+
 ---
 
 ## 4. Test Suite Execution
@@ -270,17 +295,17 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/webhooks/subscriptions \
 Run all test suites across the project:
 
 ```bash
-# 1. Run backend tests (143 tests)
+# 1. Run backend tests (148 tests)
 cd backend && uv run pytest -q
 
-# 2. Run AI engine tests (78 tests)
+# 2. Run AI engine tests (88 tests)
 cd ../ai_engine && uv run pytest -q
 
 # 3. Compile checks across both projects
 cd backend && uv run python -m compileall -q app tests && cd ../ai_engine && uv run python -m compileall -q -x "\.venv" .
 ```
 
-**Total automated tests:** **221 passed** (143 backend + 78 AI engine).
+**Total automated tests:** **236 passed** (148 backend + 88 AI engine).
 
 ---
 
