@@ -161,11 +161,11 @@ def test_incident_and_repair_endpoints():
 
 
 def test_webhook_endpoints():
-    # Outgoing subscription
+    # Outgoing subscription (public HTTPS destination)
     sub_resp = client.post(
         "/api/v1/webhooks/subscriptions",
         json={
-            "target_url": "http://127.0.0.1:9999/webhook",
+            "target_url": "https://api.kintsutech.com/webhook",
             "events": ["repair.activated"],
             "description": "Alerting system",
         },
@@ -173,10 +173,13 @@ def test_webhook_endpoints():
     assert sub_resp.status_code == 200
     assert sub_resp.json()["status"] == "subscribed"
 
-    # List subscriptions
+    # List subscriptions (secret must be redacted)
     list_resp = client.get("/api/v1/webhooks/subscriptions")
     assert list_resp.status_code == 200
-    assert len(list_resp.json()["subscriptions"]) >= 1
+    subs = list_resp.json()["subscriptions"]
+    assert len(subs) >= 1
+    assert "secret" not in subs[0]
+    assert subs[0]["secret_configured"] is True
 
     # Incoming webhook receiver with HMAC signature
     payload = json.dumps({"id": "evt_test_101", "type": "ping"}).encode("utf-8")

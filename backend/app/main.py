@@ -6,9 +6,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from app.security import verify_api_key
 
 from app.ai_adapter import AIAdapter
 from app.ai_adapter import analyze_changes as analyze_with_adapter
@@ -490,7 +492,11 @@ def list_services():
 
 
 @app.post("/api/v1/services/{service_id}")
-def register_service(service_id: str, payload: ServiceRegisterRequest):
+def register_service(
+    service_id: str,
+    payload: ServiceRegisterRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Register or update a monitored service."""
     try:
         service = storage_registry.register_service(
@@ -527,7 +533,11 @@ def get_service_baseline(service_id: str):
 
 
 @app.post("/api/v1/services/{service_id}/baseline")
-def save_service_baseline(service_id: str, payload: BaselineSaveRequest):
+def save_service_baseline(
+    service_id: str,
+    payload: BaselineSaveRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Save a new versioned baseline for a service."""
     try:
         record = storage_registry.save_baseline(
@@ -592,7 +602,11 @@ def validate_repair_proposal(payload: RepairValidationRequest):
     """
     try:
         validation_result = validate_repair(payload.adapter, payload.test_cases)
-        storage_registry.record_validation(payload.incident_id, validation_result)
+        storage_registry.record_validation(
+            payload.incident_id,
+            validation_result,
+            adapter_config=payload.adapter,
+        )
         return {
             "incident_id": payload.incident_id,
             "validation": validation_result,
@@ -602,10 +616,13 @@ def validate_repair_proposal(payload: RepairValidationRequest):
 
 
 @app.post("/api/v1/repairs/activate")
-def activate_repair(payload: RepairActivationRequest):
+def activate_repair(
+    payload: RepairActivationRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """
     Guarded repair activation.
-    Rejected if the proposal has not passed independent validation.
+    Rejected if the proposal has not passed independent validation or adapter hash mismatch.
     """
     try:
         activation = storage_registry.activate_repair(
@@ -632,7 +649,10 @@ def activate_repair(payload: RepairActivationRequest):
 
 
 @app.post("/api/v1/repairs/rollback")
-def rollback_repair(payload: RepairRollbackRequest):
+def rollback_repair(
+    payload: RepairRollbackRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """
     Deactivate active adapter and restore service to un-adapted baseline state.
     """
@@ -711,7 +731,10 @@ async def receive_incoming_webhook(request: Request):
 
 
 @app.post("/api/v1/webhooks/subscriptions")
-def create_webhook_subscription(payload: WebhookSubscriptionRequest):
+def create_webhook_subscription(
+    payload: WebhookSubscriptionRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Register an outgoing webhook destination."""
     try:
         subscription = webhook_manager.subscribe(
@@ -726,8 +749,10 @@ def create_webhook_subscription(payload: WebhookSubscriptionRequest):
 
 
 @app.get("/api/v1/webhooks/subscriptions")
-def list_webhook_subscriptions():
-    """List active outgoing webhook subscriptions."""
+def list_webhook_subscriptions(
+    auth_user: str = Depends(verify_api_key),
+):
+    """List active outgoing webhook subscriptions with secrets redacted."""
     return {"subscriptions": webhook_manager.list_subscriptions()}
 
 
@@ -747,7 +772,10 @@ def get_mcp_tools():
 
 
 @app.post("/api/v1/mcp/tools/call")
-def execute_mcp_tool(payload: MCPToolCallRequest):
+def execute_mcp_tool(
+    payload: MCPToolCallRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Execute an MCP tool request against the backend services."""
     result = call_mcp_tool(payload.name, payload.arguments)
     if "error" in result and result.get("error"):

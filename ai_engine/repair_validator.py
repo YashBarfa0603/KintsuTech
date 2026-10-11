@@ -1,6 +1,19 @@
 
+import hashlib
+import json
 from copy import deepcopy
 from typing import Any
+
+
+def compute_adapter_hash(adapter_config: dict[str, Any]) -> str:
+    """Compute a canonical SHA-256 hash of an adapter configuration."""
+    canonical_json = json.dumps(
+        adapter_config,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 def apply_compatibility_adapter(
@@ -59,6 +72,7 @@ def validate_repair(
     not from the repair model itself.
     """
     errors: list[str] = []
+    adapter_hash = compute_adapter_hash(proposal) if isinstance(proposal, dict) else None
 
     if proposal.get("operation") != "copy_field":
         return {
@@ -66,6 +80,7 @@ def validate_repair(
             "tests_passed": 0,
             "tests_failed": 0,
             "errors": ["Unsupported adapter operation."],
+            "adapter_hash": adapter_hash,
         }
 
     source_field = proposal.get("source_field")
@@ -99,6 +114,7 @@ def validate_repair(
             "tests_passed": 0,
             "tests_failed": 0,
             "errors": errors,
+            "adapter_hash": adapter_hash,
         }
 
     passed = 0
@@ -129,6 +145,7 @@ def validate_repair(
         "tests_passed": passed,
         "tests_failed": failed,
         "errors": errors,
+        "adapter_hash": adapter_hash,
     }
 
 

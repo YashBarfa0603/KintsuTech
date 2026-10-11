@@ -245,7 +245,7 @@ def call_mcp_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             test_cases = arguments["test_cases"]
 
             validation = validate_repair(adapter, test_cases)
-            storage_registry.record_validation(inc_id, validation)
+            storage_registry.record_validation(inc_id, validation, adapter_config=adapter)
             return {
                 "incident_id": inc_id,
                 "validation": validation,

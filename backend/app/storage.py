@@ -22,6 +22,9 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 
+from app.security import compute_adapter_hash
+
+
 # Base model for SQLAlchemy ORM
 class Base(DeclarativeBase):
     pass
@@ -75,6 +78,7 @@ class ValidationModel(Base):
     validation_json = Column(Text, nullable=False)
     eligible_for_activation = Column(Boolean, nullable=False)
     tests_passed = Column(Integer, default=0)
+    adapter_hash = Column(String(64), nullable=True)
     created_at = Column(String(50), nullable=False)
 
 
@@ -153,7 +157,19 @@ class StorageRegistry:
                 )
 
         Base.metadata.create_all(self._engine)
+        self._migrate_schema()
         self._session_factory = sessionmaker(bind=self._engine)
+
+    def _migrate_schema(self) -> None:
+        """Ensure schema compatibility for existing SQLite databases."""
+        with self._engine.begin() as conn:
+            try:
+                result = conn.exec_driver_sql("PRAGMA table_info(validations)")
+                existing_cols = [row[1] for row in result.fetchall()]
+                if existing_cols and "adapter_hash" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE validations ADD COLUMN adapter_hash VARCHAR(64)")
+            except Exception:
+                pass
 
     def _get_session(self) -> Session:
         return self._session_factory()
@@ -481,6 +497,7 @@ class StorageRegistry:
         self,
         incident_id: str,
         validation_result: dict[str, Any],
+        adapter_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Record validation outcome for an incident's proposed repair."""
         with self._lock:
@@ -494,6 +511,15 @@ class StorageRegistry:
                 incident.status = "repair_validated" if eligible else "validation_rejected"
                 incident.updated_at = now_str
 
+                adapter_hash = None
+                if adapter_config:
+                    adapter_hash = compute_adapter_hash(adapter_config)
+                elif "adapter_hash" in validation_result:
+                    adapter_hash = validation_result["adapter_hash"]
+
+                if adapter_hash:
+                    validation_result["adapter_hash"] = adapter_hash
+
                 val_record = session.get(ValidationModel, incident_id)
                 if not val_record:
                     val_record = ValidationModel(
@@ -501,6 +527,7 @@ class StorageRegistry:
                         validation_json=json.dumps(validation_result),
                         eligible_for_activation=eligible,
                         tests_passed=int(validation_result.get("tests_passed", 0)),
+                        adapter_hash=adapter_hash,
                         created_at=now_str,
                     )
                     session.add(val_record)
@@ -508,6 +535,7 @@ class StorageRegistry:
                     val_record.validation_json = json.dumps(validation_result)
                     val_record.eligible_for_activation = eligible
                     val_record.tests_passed = int(validation_result.get("tests_passed", 0))
+                    val_record.adapter_hash = adapter_hash
 
                 audit_event = {
                     "event": "repair_validated",
@@ -515,6 +543,7 @@ class StorageRegistry:
                     "service_id": incident.service_id,
                     "eligible": eligible,
                     "tests_passed": validation_result.get("tests_passed", 0),
+                    "adapter_hash": adapter_hash,
                     "timestamp": now_str,
                 }
                 session.add(
@@ -551,7 +580,8 @@ class StorageRegistry:
     ) -> dict[str, Any]:
         """
         Guarded repair activation.
-        Requires that the proposed adapter was verified via validation.
+        Requires that the proposed adapter was verified via validation and
+        matches the exact validated adapter configuration hash.
         """
         with self._lock:
             if not incident_id or not isinstance(incident_id, str) or not incident_id.strip():
@@ -567,6 +597,15 @@ class StorageRegistry:
                     raise ValueError(
                         f"Cannot activate repair for {incident_id}: "
                         "Repair has not passed independent validation."
+                    )
+
+                # Recompute requested adapter hash and verify binding to validated adapter
+                requested_hash = compute_adapter_hash(adapter_config)
+                if val.adapter_hash and val.adapter_hash != requested_hash:
+                    raise ValueError(
+                        f"Cannot activate repair for {incident_id}: "
+                        f"Requested adapter configuration does not match validated adapter. "
+                        f"Validated hash: '{val.adapter_hash}', requested hash: '{requested_hash}'."
                     )
 
                 now_str = datetime.now(timezone.utc).isoformat()

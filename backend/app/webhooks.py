@@ -1,3 +1,5 @@
+import os
+import secrets
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -9,18 +11,24 @@ import uuid
 
 import httpx
 
+from app.security import validate_target_url
 
-DEFAULT_WEBHOOK_SECRET = "kintsutech_webhook_secret_dev"
+
+DEFAULT_WEBHOOK_SECRET = os.environ.get("KINTSUTECH_WEBHOOK_SECRET") or ""
 
 
 class WebhookManager:
     """
     Manages incoming webhook signature verification, deduplication,
-    outgoing event subscriptions, and delivery with retries.
+    outgoing event subscriptions, SSRF validation, and delivery with retries.
     """
 
-    def __init__(self, secret: str = DEFAULT_WEBHOOK_SECRET) -> None:
-        self.secret = secret
+    def __init__(self, secret: str | None = None) -> None:
+        if secret:
+            self.secret = secret
+        else:
+            env_secret = os.environ.get("KINTSUTECH_WEBHOOK_SECRET")
+            self.secret = env_secret if env_secret else secrets.token_hex(32)
         self._lock = Lock()
         self._processed_events: set[str] = set()  # Event deduplication cache
         self._subscriptions: dict[str, dict[str, Any]] = {}  # subscription_id -> sub
@@ -40,7 +48,11 @@ class WebhookManager:
         if not signature_header:
             return False
 
-        key = (secret or self.secret).encode("utf-8")
+        effective_secret = secret or self.secret
+        if not effective_secret:
+            return False
+
+        key = effective_secret.encode("utf-8")
         expected_hex = hmac.new(key, payload_bytes, hashlib.sha256).hexdigest()
 
         given_hex = signature_header.strip()
@@ -90,10 +102,12 @@ class WebhookManager:
         events: list[str],
         secret: str | None = None,
         description: str = "",
+        dns_resolver: Callable[[str, int], list[tuple[Any, ...]]] | None = None,
     ) -> dict[str, Any]:
-        """Register an outgoing webhook destination."""
-        if not target_url or not target_url.startswith(("http://", "https://")):
-            raise ValueError("Valid http or https target_url is required.")
+        """Register an outgoing webhook destination after strict SSRF validation."""
+        validate_target_url(target_url, dns_resolver=dns_resolver)
+
+        sub_secret = secret or self.secret or secrets.token_hex(32)
 
         with self._lock:
             sub_id = f"sub_{uuid.uuid4().hex[:12]}"
@@ -101,7 +115,7 @@ class WebhookManager:
                 "id": sub_id,
                 "target_url": target_url,
                 "events": events,
-                "secret": secret or self.secret,
+                "secret": sub_secret,
                 "description": description,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -109,9 +123,15 @@ class WebhookManager:
             return sub
 
     def list_subscriptions(self) -> list[dict[str, Any]]:
-        """List active webhook subscriptions."""
+        """List active webhook subscriptions with secrets redacted."""
         with self._lock:
-            return list(self._subscriptions.values())
+            sanitized: list[dict[str, Any]] = []
+            for sub in self._subscriptions.values():
+                entry = dict(sub)
+                entry.pop("secret", None)
+                entry["secret_configured"] = bool(sub.get("secret"))
+                sanitized.append(entry)
+            return sanitized
 
     def create_event(
         self,
@@ -134,7 +154,10 @@ class WebhookManager:
 
     def sign_payload(self, payload_bytes: bytes, secret: str | None = None) -> str:
         """Sign outgoing payload with HMAC-SHA256."""
-        key = (secret or self.secret).encode("utf-8")
+        effective_secret = secret or self.secret
+        if not effective_secret:
+            raise ValueError("Webhook secret is required to sign payload.")
+        key = effective_secret.encode("utf-8")
         digest = hmac.new(key, payload_bytes, hashlib.sha256).hexdigest()
         return f"sha256={digest}"
 
@@ -144,9 +167,12 @@ class WebhookManager:
         *,
         client: httpx.Client | None = None,
         max_attempts: int = 3,
+        dns_resolver: Callable[[str, int], list[tuple[Any, ...]]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Send event to all matching subscribers with HMAC signature and retries.
+        Validates target URL immediately before dispatch to mitigate DNS rebinding.
+        Enforces follow_redirects=False to prevent redirect-based SSRF bypass.
         """
         event_type = event.get("type", "")
         payload_bytes = json.dumps(event).encode("utf-8")
@@ -160,6 +186,27 @@ class WebhookManager:
         delivery_results = []
         for sub in matched_subs:
             target_url = sub["target_url"]
+
+            # Re-validate destination URL before dispatch to prevent DNS rebinding
+            try:
+                validate_target_url(target_url, dns_resolver=dns_resolver)
+            except ValueError as val_err:
+                log_entry = {
+                    "event_id": event.get("id"),
+                    "event_type": event_type,
+                    "subscription_id": sub["id"],
+                    "target_url": target_url,
+                    "attempts": 0,
+                    "status": "failed",
+                    "status_code": None,
+                    "error": f"SSRF blocked: {val_err}",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+                with self._lock:
+                    self._delivery_logs.append(log_entry)
+                delivery_results.append(log_entry)
+                continue
+
             sub_secret = sub.get("secret", self.secret)
             sig_header = self.sign_payload(payload_bytes, sub_secret)
             headers = {
@@ -178,7 +225,7 @@ class WebhookManager:
                     if client:
                         resp = client.post(target_url, content=payload_bytes, headers=headers)
                     else:
-                        with httpx.Client(timeout=5.0) as default_client:
+                        with httpx.Client(timeout=5.0, follow_redirects=False) as default_client:
                             resp = default_client.post(target_url, content=payload_bytes, headers=headers)
 
                     status_code = resp.status_code
