@@ -1,4 +1,7 @@
 from collections import deque
+import asyncio
+import tempfile
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
@@ -7,13 +10,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+import logging
+import platform
 
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
 # Load environment variables from .env
 load_dotenv()
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -214,7 +220,10 @@ class BoundedBodyLimitMiddleware:
             return
 
         try:
-            max_size = int(os.environ.get("MAX_REQUEST_BODY_SIZE", str(self.default_max_size)))
+            if scope.get("path") == "/api/v1/agent/transcribe":
+                max_size = int(os.environ.get("MAX_AUDIO_REQUEST_BODY_SIZE", "8388608"))
+            else:
+                max_size = int(os.environ.get("MAX_REQUEST_BODY_SIZE", str(self.default_max_size)))
         except ValueError:
             max_size = self.default_max_size
 
@@ -1249,6 +1258,146 @@ def execute_mcp_tool(
     if "error" in result and result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return {"tool": payload.name, "result": result}
+
+
+
+# Local-only speech transcription with MLX Whisper.
+_WHISPER_LOCK = threading.Lock()
+_MAX_AUDIO_FILE_BYTES = 7 * 1024 * 1024
+_AUDIO_SUFFIXES = {
+    "audio/webm": ".webm",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".mp4",
+    "audio/mpeg": ".mp3",
+    "audio/aac": ".aac",
+}
+
+
+class MLXWhisperUnavailableError(HTTPException):
+    """Raised when runtime platform or MLX Whisper dependency is unsupported."""
+
+    def __init__(
+        self,
+        detail: str = "Local voice transcription is unavailable: MLX Whisper requires macOS on Apple Silicon.",
+    ) -> None:
+        super().__init__(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail,
+        )
+
+
+def _check_mlx_whisper_support() -> None:
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        raise MLXWhisperUnavailableError(
+            "Local voice transcription is unavailable: MLX Whisper requires macOS on Apple Silicon."
+        )
+    try:
+        import mlx_whisper  # noqa: F401
+    except (ImportError, ModuleNotFoundError) as exc:
+        logger.warning("MLX Whisper module could not be imported: %s", exc)
+        raise MLXWhisperUnavailableError(
+            "Local voice transcription is unavailable: MLX Whisper dependency is not installed."
+        ) from exc
+
+
+def _transcribe_local_audio(file_path: str) -> str:
+    _check_mlx_whisper_support()
+
+    import mlx_whisper
+
+    model = os.environ.get(
+        "KINTSUTECH_WHISPER_MODEL", "mlx-community/whisper-tiny"
+    )
+    language = os.environ.get("KINTSUTECH_WHISPER_LANGUAGE") or None
+
+    with _WHISPER_LOCK:
+        result = mlx_whisper.transcribe(
+            file_path,
+            path_or_hf_repo=model,
+            language=language,
+            verbose=False,
+        )
+    return str(result.get("text", "")).strip()
+
+
+@app.post(
+    "/api/v1/agent/transcribe",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+async def transcribe_agent_audio(
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+):
+    """Transcribe a short audio clip locally with MLX Whisper."""
+    del current_user
+
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    suffix = _AUDIO_SUFFIXES.get(content_type)
+    if suffix is None:
+        await file.close()
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported audio format.",
+        )
+
+    temp_path = None
+    total_bytes = 0
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=suffix, prefix="kintsu-whisper-", delete=False
+        ) as temp_file:
+            temp_path = temp_file.name
+            while True:
+                chunk = await file.read(64 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > _MAX_AUDIO_FILE_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Audio file exceeds the 7 MB upload limit.",
+                    )
+                temp_file.write(chunk)
+
+        if total_bytes == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The audio file is empty.",
+            )
+
+        transcript = await asyncio.to_thread(_transcribe_local_audio, temp_path)
+        if not transcript:
+            raise HTTPException(
+                status_code=422,
+                detail="No speech could be recognized. Please try again.",
+            )
+
+        return {
+            "text": transcript,
+            "engine": "mlx-whisper",
+            "local_processing": True,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Unexpected error during local audio transcription: %s", exc, exc_info=True
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Local transcription failed. Check backend logs and Whisper model.",
+        ) from exc
+    finally:
+        await file.close()
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError as err:
+                logger.warning(
+                    "Failed to remove temporary audio file %s: %s", temp_path, err
+                )
 
 
 # Conversational AI Agent Endpoint

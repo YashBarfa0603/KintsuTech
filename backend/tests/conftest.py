@@ -3,6 +3,7 @@ import pytest
 from app.auth import AuthenticatedUser, get_current_user
 from app.main import app
 from app.mock_apis import get_weather_response
+from app.rate_limiter import rate_limiter
 from app.storage import storage_registry
 
 
@@ -13,6 +14,7 @@ def clean_test_storage():
     state, preventing cross-test pollution while testing full API endpoints.
     """
     storage_registry.reset()
+    rate_limiter.reset()
     storage_registry.register_service(
         "weather",
         name="Mock Weather Service",
@@ -25,6 +27,7 @@ def clean_test_storage():
         description="Initial known-good Weather v1 baseline",
     )
     yield
+    rate_limiter.reset()
 
 
 @pytest.fixture(autouse=True)
