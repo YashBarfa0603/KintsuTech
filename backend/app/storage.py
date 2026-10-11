@@ -188,10 +188,21 @@ class StorageRegistry:
                 poolclass=StaticPool,
             )
         else:
-            if db_url.startswith("sqlite://") or "://" in db_url:
+            if db_url.startswith("sqlite:///") and not db_url.startswith("sqlite:///:memory:"):
+                raw_path = db_url.replace("sqlite:///", "", 1)
+                p = Path(raw_path)
+                if not p.is_absolute():
+                    if raw_path.startswith("backend/") and not Path("backend").exists():
+                        p = Path(raw_path[len("backend/"):])
+                    p = p.resolve()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._db_url = f"sqlite:///{p.as_posix()}"
+            elif db_url.startswith("sqlite://") or "://" in db_url:
                 self._db_url = db_url
             else:
-                self._db_url = f"sqlite:///{Path(db_url).resolve()}"
+                p = Path(db_url).resolve()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                self._db_url = f"sqlite:///{p.as_posix()}"
 
             if self._db_url.startswith("sqlite:///:memory:"):
                 self._engine = create_engine(

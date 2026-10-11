@@ -212,15 +212,17 @@ def verify_supabase_token(token: str) -> AuthenticatedUser:
     jwks_client = get_jwks_client()
     if jwks_client:
         try:
-            signing_key = jwks_client.get_signing_key_from_jwt(token)
-            claims = jwt.decode(
-                token,
-                signing_key.key,
-                algorithms=["RS256", "ES256", "EdDSA"],
-                options={"verify_aud": False, "verify_iss": False},
-                leeway=60,
-            )
-            verified_locally = True
+            token_alg = jwt.get_unverified_header(token).get("alg")
+            if token_alg in ("RS256", "ES256", "EdDSA"):
+                signing_key = jwks_client.get_signing_key_from_jwt(token)
+                claims = jwt.decode(
+                    token,
+                    signing_key.key,
+                    algorithms=["RS256", "ES256", "EdDSA"],
+                    options={"verify_aud": False, "verify_iss": False},
+                    leeway=60,
+                )
+                verified_locally = True
         except jwt.ExpiredSignatureError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
