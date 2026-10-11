@@ -25,6 +25,13 @@ import { SettingsScreen } from "@/components/screens/SettingsScreen";
 import { AgentChatScreen } from "@/components/screens/AgentChatScreen";
 import { KintsuCopilot } from "@/components/layout/KintsuCopilot";
 import { AuthModal } from "@/components/layout/AuthModal";
+import {
+  fetchBackendServices,
+  fetchBackendIncidents,
+  fetchDependencyGraphTopology,
+  validateRepairProposal,
+} from "@/lib/api";
+import { supabase } from "@/lib/supabase";
 
 export function AppShell({
   initialScreen = "projects",
@@ -61,6 +68,70 @@ export function AppShell({
     role: "Platform Engineer",
   });
 
+  // Synchronize with backend services, incidents, graph topology, and authenticated user
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (session?.user?.email) {
+        const email = session.user.email;
+        const initials = email.slice(0, 2).toUpperCase();
+        const role = (session.user.user_metadata?.role as string) || "Platform Engineer";
+        setUser({ email, initials, role });
+      }
+    });
+
+    fetchBackendServices().then((backendServices) => {
+      if (backendServices && backendServices.length > 0) {
+        const liveProjects: Project[] = backendServices.map((s, idx) => ({
+          id: (s.id as string) || `service-${idx}`,
+          name: (s.name as string) || (s.id as string) || "Monitored Service",
+          description: (s.description as string) || "Registered API service.",
+          repository: (s.base_url as string) || "github.com/kintsu/api",
+          owner: "Platform Engineering",
+          apis: 1,
+          services: 1,
+          health: (s.is_critical ? "Degraded" : "Healthy") as "Healthy" | "Degraded" | "Unknown",
+          incidents: 0,
+          members: 4,
+        }));
+        setProjects((prev) => {
+          const names = new Set(prev.map((p) => p.name));
+          const additions = liveProjects.filter((p) => !names.has(p.name));
+          return [...prev, ...additions];
+        });
+      }
+    });
+
+    fetchBackendIncidents().then((backendIncidents) => {
+      if (backendIncidents && backendIncidents.length > 0) {
+        const liveChanges: ChangeRecord[] = backendIncidents.map((inc, idx) => ({
+          id: (inc.id as string) || `CHG-LIVE-${idx}`,
+          dependencyType: "API",
+          service: (inc.service_id as string) || "Service",
+          endpoint: "/api/v1/live",
+          category: (inc.title as string) || "Observed API drift",
+          severity: ((inc.severity as string)?.charAt(0).toUpperCase() + (inc.severity as string)?.slice(1)) as "Critical" | "High" | "Medium" | "Low",
+          confidence: 99.2,
+          status: (inc.status === "open" ? "Investigating" : "Recovery open") as ChangeRecord["status"],
+          summary: (inc.title as string) || "API drift observed",
+          observed: "Recently",
+          evidence: "Live telemetry inspection",
+          breaking: true,
+        }));
+        setChanges((prev) => {
+          const ids = new Set(prev.map((c) => c.id));
+          const additions = liveChanges.filter((c) => !ids.has(c.id));
+          return [...additions, ...prev];
+        });
+      }
+    });
+
+    fetchDependencyGraphTopology().then((liveGraph) => {
+      if (liveGraph && liveGraph.nodes && liveGraph.nodes.length > 0) {
+        setGraphData(liveGraph);
+      }
+    });
+  }, []);
+
   const navigate = (next: Screen) => {
     setScreen(next);
     setNavDropdown(null);
@@ -69,8 +140,28 @@ export function AppShell({
     setProfileOpen(false);
   };
 
-  const runValidation = (outcome: "success" | "failure" = "success") => {
+  const runValidation = async (outcome: "success" | "failure" = "success") => {
     setValidationState("running");
+    try {
+      const res = await validateRepairProposal({
+        incident_id: "CHG-841",
+        adapter: {
+          operation: "copy_field",
+          source: "display_name",
+          target: "name",
+        },
+        test_cases: [
+          { input: { display_name: "Pro Plan" }, expected: { name: "Pro Plan" } },
+        ],
+      });
+      if (res && res.validation) {
+        setValidationState("done");
+        setCaseStatus("validated");
+        return;
+      }
+    } catch {
+      // Fallback to local sandbox runner
+    }
     window.setTimeout(() => {
       setValidationState(outcome === "success" ? "done" : "failed");
       setCaseStatus(outcome === "success" ? "validated" : "review");

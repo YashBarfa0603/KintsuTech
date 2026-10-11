@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { Screen } from "@/types";
 import { Button } from "@/components/ui/Primitives";
 import { Icon } from "@/components/ui/Icons";
+import { sendAgentChatMessage } from "@/lib/api";
 
 export function KintsuCopilot({
   open,
@@ -25,14 +26,25 @@ export function KintsuCopilot({
   ]);
   const [voiceActive, setVoiceActive] = useState(false);
 
-  const handleSubmit = (e?: React.FormEvent) => {
+  const handleSubmit = async (e?: React.FormEvent) => {
     e?.preventDefault();
     if (!input.trim()) return;
 
     const q = input;
     setInput("");
-    const lower = q.toLowerCase();
+    setMessages((prev) => [...prev, { who: "user", text: q }]);
 
+    try {
+      const res = await sendAgentChatMessage(q, undefined, { screen: context });
+      if (res && res.response) {
+        setMessages((prev) => [...prev, { who: "ai", text: res.response }]);
+        return;
+      }
+    } catch {
+      // Fallback to contextual response
+    }
+
+    const lower = q.toLowerCase();
     let answer =
       "I analyzed case KIN-2841 in Stripe API. The field `name` was replaced by `display_name` at 14:14 UTC across 412 observed responses.";
 
@@ -50,7 +62,7 @@ export function KintsuCopilot({
         "The proposed fix creates a boundary adapter `normalizeIntent` with fallback `display_name ?? name` and source telemetry.";
     }
 
-    setMessages((prev) => [...prev, { who: "user", text: q }, { who: "ai", text: answer }]);
+    setMessages((prev) => [...prev, { who: "ai", text: answer }]);
   };
 
   const toggleVoice = () => {
