@@ -1,4 +1,4 @@
-
+from behavior_checks import check_retry_timing
 from behavior_checks import check_pagination, check_rate_limit
 
 
@@ -155,3 +155,47 @@ def test_rate_limit_header_names_are_case_insensitive():
 
     assert result["status"] == "UNCHANGED"
     assert result["observed"]["retry_after"] == "10"
+
+
+def test_retry_timing_accepts_sufficient_wait():
+    result = check_retry_timing(
+        1.0,
+        1.2,
+        baseline_status="verified",
+    )
+
+    assert result["status"] == "UNCHANGED"
+    assert result["differences"] == []
+
+
+def test_retry_timing_detects_early_retry():
+    result = check_retry_timing(
+        1.0,
+        0.2,
+        baseline_status="verified",
+    )
+
+    assert result["status"] == "CHANGED"
+    assert result["differences"][0]["reason"] == "retry_too_early"
+
+
+def test_retry_timing_detects_missing_retry():
+    result = check_retry_timing(
+        1.0,
+        None,
+        baseline_status="verified",
+    )
+
+    assert result["status"] == "CHANGED"
+    assert result["differences"][0]["reason"] == "retry_not_observed"
+
+
+def test_retry_timing_keeps_unverified_baseline_unverified():
+    result = check_retry_timing(
+        1.0,
+        0.2,
+        baseline_status="unverified",
+    )
+
+    assert result["status"] == "UNVERIFIED"
+    assert result["differences"]

@@ -7,6 +7,7 @@
       "id": "DEFAULT-001",
       "category": "default_value",
       "name": "Default page size",
+      "baseline_status": "unverified",
       "request": {
         "method": "GET",
         "path": "/products",
@@ -22,6 +23,7 @@
       "id": "ERROR-001",
       "category": "error_response",
       "name": "Invalid input response",
+      "baseline_status": "unverified",
       "request": {
         "method": "GET",
         "path": "/products",
@@ -40,6 +42,7 @@
       "id": "PAGE-001",
       "category": "pagination",
       "name": "Next-page continuation",
+      "baseline_status": "unverified",
       "request": {
         "method": "GET",
         "path": "/products",
@@ -59,22 +62,40 @@
       "id": "RATE-001",
       "category": "rate_limit",
       "name": "Rate-limit response",
+      "baseline_status": "unverified",
       "request": {
         "method": "GET",
         "path": "/products",
-        "query": {}
+        "query": {
+          "scenario": "rate_limit"
+        }
       },
       "expected": {
-        "rate_limited_status_code": 429,
-        "retry_after_respected": true
+        "rate_limited_status_code": 429
       },
       "comparison": "contract",
       "severity": "high"
     },
     {
+      "id": "RETRY-001",
+      "category": "retry_timing",
+      "name": "Retry respects Retry-After delay",
+      "baseline_status": "unverified",
+      "request": {
+        "method": "GET",
+        "path": "/products",
+        "query": {
+          "scenario": "retry_once"
+        }
+      },
+      "comparison": "evidence",
+      "severity": "medium"
+    },
+    {
       "id": "SEMANTIC-001",
       "category": "semantic_invariant",
       "name": "Price remains non-negative",
+      "baseline_status": "unverified",
       "request": {
         "method": "GET",
         "path": "/products",

@@ -1,4 +1,3 @@
-
 from typing import Any
 
 
@@ -8,31 +7,37 @@ def build_unified_change_report(
     text_diff: list[dict[str, str]],
     pagination_reports: list[dict[str, Any]] | None = None,
     rate_limit_reports: list[dict[str, Any]] | None = None,
+    retry_timing_reports: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
-    Combine structural, behavioral, text-diff, pagination, and rate-limit
-    evidence into one report.
+    Combine structural, behavioral, text-diff, pagination,
+    rate-limit, and retry-timing evidence into one report.
 
     Only classified changes are added as findings.
     Successful traversal metrics remain evidence, not change findings.
     """
+
     pagination_reports = pagination_reports or []
     rate_limit_reports = rate_limit_reports or []
+    retry_timing_reports = retry_timing_reports or []
 
     changes: list[dict[str, Any]] = []
 
+    # Structural changes
     for change in schema_report.get("changes", []):
         changes.append({
             "source": "structural",
             **change,
         })
 
+    # Behavioral changes
     for change in behavior_report.get("changes", []):
         changes.append({
             "source": "behavioral",
             **change,
         })
 
+    # Text differences
     for operation in text_diff:
         if operation.get("operation") in ("insert", "delete"):
             changes.append({
@@ -41,6 +46,7 @@ def build_unified_change_report(
                 "value": operation["value"],
             })
 
+    # Classified findings from controlled checks
     def add_check_findings(
         reports: list[dict[str, Any]],
         source: str,
@@ -58,9 +64,9 @@ def build_unified_change_report(
 
     add_check_findings(pagination_reports, "pagination")
     add_check_findings(rate_limit_reports, "rate_limit")
+    add_check_findings(retry_timing_reports, "retry_timing")
 
-    # Summarize observed traversal results without treating success
-    # as a change or assuming that the production baseline is verified.
+    # Pagination metrics: evidence, not automatically findings.
     completed_runs = [
         report.get("traversal", report)
         for report in pagination_reports
@@ -93,6 +99,7 @@ def build_unified_change_report(
         ),
     }
 
+    # Summary by finding source
     summary = {
         "structural_changes": sum(
             change["source"] == "structural" for change in changes
@@ -108,6 +115,9 @@ def build_unified_change_report(
         ),
         "rate_limit_changes": sum(
             change["source"] == "rate_limit" for change in changes
+        ),
+        "retry_timing_changes": sum(
+            change["source"] == "retry_timing" for change in changes
         ),
     }
 
@@ -126,5 +136,6 @@ def build_unified_change_report(
             "text_diff": text_diff,
             "pagination_reports": pagination_reports,
             "rate_limit_reports": rate_limit_reports,
+            "retry_timing_reports": retry_timing_reports,
         },
     }

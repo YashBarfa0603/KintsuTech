@@ -1,4 +1,3 @@
-
 from change_report import build_unified_change_report
 
 
@@ -50,6 +49,7 @@ def test_combines_all_three_change_sources():
         "text_diff_changes": 2,
         "pagination_changes": 0,
         "rate_limit_changes": 0,
+        "retry_timing_changes": 0,
     }
 
 
@@ -153,10 +153,43 @@ def test_unified_report_includes_pagination_and_rate_limit_changes():
     assert report["has_changes"] is True
     assert report["summary"]["pagination_changes"] == 1
     assert report["summary"]["rate_limit_changes"] == 1
+    assert report["summary"]["retry_timing_changes"] == 0
     assert report["total_change_count"] == 2
 
     assert report["changes"][0]["source"] == "pagination"
     assert report["changes"][1]["source"] == "rate_limit"
+
+
+def test_unified_report_includes_retry_timing_changes():
+    retry_timing = {
+        "case_id": "RETRY-001",
+        "check": "retry_timing",
+        "status": "CHANGED",
+        "baseline_status": "verified",
+        "differences": [
+            {
+                "reason": "retry_too_early",
+                "required_delay_seconds": 1.0,
+                "observed_delay_seconds": 0.2,
+            }
+        ],
+    }
+
+    report = build_unified_change_report(
+        schema_report={
+            "changes": [],
+            "breaking_change_count": 0,
+        },
+        behavior_report={"changes": []},
+        text_diff=[],
+        retry_timing_reports=[retry_timing],
+    )
+
+    assert report["has_changes"] is True
+    assert report["summary"]["retry_timing_changes"] == 1
+    assert report["total_change_count"] == 1
+    assert report["changes"][0]["source"] == "retry_timing"
+    assert report["evidence"]["retry_timing_reports"] == [retry_timing]
 
 
 def test_unverified_checks_are_preserved_but_not_confirmed():
@@ -181,3 +214,30 @@ def test_unverified_checks_are_preserved_but_not_confirmed():
     assert report["has_changes"] is False
     assert report["total_change_count"] == 0
     assert report["evidence"]["pagination_reports"] == [pagination]
+
+
+def test_unverified_retry_timing_is_preserved_but_not_confirmed():
+    retry_timing = {
+        "case_id": "RETRY-001",
+        "check": "retry_timing",
+        "status": "UNVERIFIED",
+        "baseline_status": "unverified",
+        "differences": [
+            {"reason": "retry_too_early"}
+        ],
+    }
+
+    report = build_unified_change_report(
+        schema_report={
+            "changes": [],
+            "breaking_change_count": 0,
+        },
+        behavior_report={"changes": []},
+        text_diff=[],
+        retry_timing_reports=[retry_timing],
+    )
+
+    assert report["has_changes"] is False
+    assert report["total_change_count"] == 0
+    assert report["summary"]["retry_timing_changes"] == 0
+    assert report["evidence"]["retry_timing_reports"] == [retry_timing]

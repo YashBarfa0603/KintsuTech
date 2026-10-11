@@ -1,4 +1,3 @@
-
 import os
 from typing import Any
 
@@ -7,10 +6,11 @@ import httpx
 from behavior_checks import check_pagination, check_rate_limit
 from behavior_runner import load_behavior_cases
 from pagination_runner import run_pagination
+from retry_runner import run_retry_check
 
 
 def run_controlled_behavior_checks() -> dict[str, Any]:
-    """Run real pagination and rate-limit checks against a controlled API."""
+    """Run controlled pagination, rate-limit, and retry-timing checks."""
 
     base_url = os.environ.get("KINTSUTECH_API_URL")
     if not base_url:
@@ -20,6 +20,7 @@ def run_controlled_behavior_checks() -> dict[str, Any]:
 
     pagination_reports = []
     rate_limit_reports = []
+    retry_timing_reports = []
 
     cases = load_behavior_cases()
 
@@ -46,7 +47,9 @@ def run_controlled_behavior_checks() -> dict[str, Any]:
                     body = response.json()
 
                     if not isinstance(body, dict):
-                        raise ValueError("Pagination response must be a JSON object.")
+                        raise ValueError(
+                            "Pagination response must be a JSON object."
+                        )
 
                     pagination_check = check_pagination(
                         body,
@@ -126,7 +129,32 @@ def run_controlled_behavior_checks() -> dict[str, Any]:
                         "error": str(exc),
                     })
 
+            elif category == "retry_timing":
+                try:
+                    report = run_retry_check(
+                        client,
+                        path,
+                        params=query,
+                        baseline_status=baseline_status,
+                    )
+
+                    retry_timing_reports.append({
+                        "case_id": case.get("id"),
+                        **report,
+                    })
+
+                except httpx.HTTPError as exc:
+                    retry_timing_reports.append({
+                        "case_id": case.get("id"),
+                        "check": "retry_timing",
+                        "status": "UNVERIFIED",
+                        "baseline_status": baseline_status,
+                        "differences": [],
+                        "error": str(exc),
+                    })
+
     return {
         "pagination_reports": pagination_reports,
         "rate_limit_reports": rate_limit_reports,
+        "retry_timing_reports": retry_timing_reports,
     }

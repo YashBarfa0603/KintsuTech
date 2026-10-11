@@ -1,4 +1,3 @@
-
 import json
 import sys
 from pathlib import Path
@@ -26,6 +25,7 @@ def run_change_workflow(
     text_diff: list[dict[str, str]] | None = None,
     pagination_reports: list[dict[str, Any]] | None = None,
     rate_limit_reports: list[dict[str, Any]] | None = None,
+    retry_timing_reports: list[dict[str, Any]] | None = None,
     run_behavior_tests: bool = False,
 ) -> dict[str, Any]:
     """Detect changes, assemble evidence, and invoke the gated repair pipeline."""
@@ -55,14 +55,12 @@ def run_change_workflow(
                 result.get("status") == "CHANGED"
                 and result.get("baseline_status") == "verified"
             ):
-                confirmed_changes.append(
-                    {
-                        "kind": "behavior_case_changed",
-                        "case_id": result.get("case_id"),
-                        "name": result.get("name"),
-                        "differences": result.get("differences", []),
-                    }
-                )
+                confirmed_changes.append({
+                    "kind": "behavior_case_changed",
+                    "case_id": result.get("case_id"),
+                    "name": result.get("name"),
+                    "differences": result.get("differences", []),
+                })
 
         behavior_report = {
             **existing_behavior_report,
@@ -77,16 +75,22 @@ def run_change_workflow(
         controlled_reports = {
             "pagination_reports": [],
             "rate_limit_reports": [],
+            "retry_timing_reports": [],
         }
 
     pagination_reports = (
         (pagination_reports or [])
-        + controlled_reports["pagination_reports"]
+        + controlled_reports.get("pagination_reports", [])
     )
 
     rate_limit_reports = (
         (rate_limit_reports or [])
-        + controlled_reports["rate_limit_reports"]
+        + controlled_reports.get("rate_limit_reports", [])
+    )
+
+    retry_timing_reports = (
+        (retry_timing_reports or [])
+        + controlled_reports.get("retry_timing_reports", [])
     )
 
     # Stage 3: Assemble evidence from all available detectors.
@@ -96,6 +100,7 @@ def run_change_workflow(
         text_diff=text_diff or [],
         pagination_reports=pagination_reports,
         rate_limit_reports=rate_limit_reports,
+        retry_timing_reports=retry_timing_reports,
     )
 
     # Stage 4: Skip repair analysis only when no findings were detected.

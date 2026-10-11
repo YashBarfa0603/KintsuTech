@@ -150,3 +150,61 @@ def check_rate_limit(
         "observed": observed,
         "differences": differences,
     }
+
+
+def check_retry_timing(
+    retry_after_seconds: float,
+    elapsed_seconds: float | None,
+    *,
+    baseline_status: str = "unverified",
+    tolerance_seconds: float = 0.1,
+) -> dict[str, Any]:
+    """
+    Check whether a retry occurred after the required Retry-After delay.
+
+    elapsed_seconds must be measured between receiving the 429 response
+    and sending the next request. Pass None if no retry was observed.
+    """
+    differences: list[dict[str, Any]] = []
+
+    observed = {
+        "required_delay_seconds": retry_after_seconds,
+        "elapsed_seconds": elapsed_seconds,
+        "retry_observed": elapsed_seconds is not None,
+    }
+
+    if retry_after_seconds < 0 or tolerance_seconds < 0:
+        return {
+            "check": "retry_timing",
+            "status": "INVALID_INPUT",
+            "baseline_status": baseline_status,
+            "observed": observed,
+            "differences": [],
+        }
+
+    if elapsed_seconds is None:
+        differences.append({
+            "field": "retry",
+            "reason": "retry_not_observed",
+        })
+    elif elapsed_seconds < 0:
+        differences.append({
+            "field": "elapsed_seconds",
+            "reason": "invalid_elapsed_time",
+            "actual": elapsed_seconds,
+        })
+    elif elapsed_seconds + tolerance_seconds < retry_after_seconds:
+        differences.append({
+            "field": "elapsed_seconds",
+            "reason": "retry_too_early",
+            "expected_minimum": retry_after_seconds,
+            "actual": elapsed_seconds,
+        })
+
+    return {
+        "check": "retry_timing",
+        "status": _classify(differences, baseline_status),
+        "baseline_status": baseline_status,
+        "observed": observed,
+        "differences": differences,
+    }
