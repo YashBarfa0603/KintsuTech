@@ -29,6 +29,98 @@ def is_auth_enforced() -> bool:
     return env == "production" or require_auth
 
 
+INSECURE_SECRETS_BLACKLIST = {
+    "changeme",
+    "secret",
+    "password",
+    "123456",
+    "12345678",
+    "admin",
+    "test",
+    "kintsutech",
+    "kintsutech-secret",
+    "development",
+}
+
+
+def is_insecure_secret(val: str) -> bool:
+    v = val.strip().lower()
+    if v in INSECURE_SECRETS_BLACKLIST:
+        return True
+    if any(v.startswith(bad) or v == bad * 2 for bad in ("password", "changeme", "secret", "admin")):
+        return True
+    return False
+
+
+def validate_production_config() -> None:
+    """
+    Fail-closed validation of production environment configuration.
+    Refuses startup if required secrets or safe configurations are missing.
+    """
+    env = (os.environ.get("ENVIRONMENT") or os.environ.get("KINTSUTECH_ENV") or "development").lower()
+    if env != "production":
+        return
+
+    # 1. API key required in production
+    api_key = get_configured_api_key()
+    if not api_key or not api_key.strip():
+        raise RuntimeError(
+            "Production configuration error: KINTSUTECH_API_KEY must be set in production."
+        )
+    if len(api_key.strip()) < 16 or is_insecure_secret(api_key):
+        raise RuntimeError(
+            "Production configuration error: KINTSUTECH_API_KEY is too short or insecure (must be at least 16 characters and not a trivial default)."
+        )
+
+    # 2. Webhook secret required in production
+    webhook_secret = os.environ.get("KINTSUTECH_WEBHOOK_SECRET")
+    if not webhook_secret or not webhook_secret.strip():
+        raise RuntimeError(
+            "Production configuration error: KINTSUTECH_WEBHOOK_SECRET must be explicitly configured in production."
+        )
+    if len(webhook_secret.strip()) < 16 or is_insecure_secret(webhook_secret):
+        raise RuntimeError(
+            "Production configuration error: KINTSUTECH_WEBHOOK_SECRET is too short or insecure (must be at least 16 characters)."
+        )
+
+    # 3. CORS origins must be explicitly configured without wildcards
+    frontend_origins = os.environ.get("FRONTEND_ORIGINS")
+    if not frontend_origins or not frontend_origins.strip():
+        raise RuntimeError(
+            "Production configuration error: FRONTEND_ORIGINS must be explicitly configured in production."
+        )
+    origins = [o.strip() for o in frontend_origins.split(",") if o.strip()]
+    if "*" in origins:
+        raise RuntimeError(
+            "Production configuration error: FRONTEND_ORIGINS cannot contain wildcard '*' in production."
+        )
+
+
+def is_trusted_proxy_enabled() -> bool:
+    """Determine whether reverse-proxy forwarded headers should be trusted."""
+    return os.environ.get("KINTSUTECH_TRUST_PROXY", "false").lower() in ("true", "1")
+
+
+def get_client_ip(request: Request) -> str:
+    """
+    Safely extract client IP address.
+    Does NOT trust X-Forwarded-For or X-Real-IP headers unless KINTSUTECH_TRUST_PROXY is explicitly enabled.
+    """
+    if is_trusted_proxy_enabled():
+        forwarded = request.headers.get("X-Forwarded-For")
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+            if client_ip:
+                return client_ip
+        real_ip = request.headers.get("X-Real-IP")
+        if real_ip and real_ip.strip():
+            return real_ip.strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+    return "127.0.0.1"
+
+
 def verify_api_key(request: Request) -> str:
     """
     Authenticate sensitive mutation endpoints using API key.

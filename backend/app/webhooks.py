@@ -282,6 +282,13 @@ class WebhookManager:
 
         return delivery_results
 
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        """Ensure thread pool executor is active, reinitializing if shut down."""
+        with self._lock:
+            if getattr(self._executor, "_shutdown", False):
+                self._executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="kintsu_webhook")
+            return self._executor
+
     def dispatch_event_background(
         self,
         event: dict[str, Any],
@@ -295,7 +302,8 @@ class WebhookManager:
         Asynchronously dispatch event to subscribers in a background thread pool.
         Does not block the calling HTTP request.
         """
-        return self._executor.submit(
+        executor = self._ensure_executor()
+        return executor.submit(
             self.dispatch_event,
             event,
             client=client,
@@ -310,7 +318,9 @@ class WebhookManager:
 
     def shutdown(self, wait: bool = False) -> None:
         """Shutdown background thread pool executor."""
-        self._executor.shutdown(wait=wait)
+        with self._lock:
+            if hasattr(self, "_executor") and self._executor:
+                self._executor.shutdown(wait=wait)
 
 
 # Singleton instance

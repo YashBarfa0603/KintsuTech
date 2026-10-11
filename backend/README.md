@@ -162,13 +162,18 @@ curl -s http://127.0.0.1:8000/api/v1/repairs/audit
 
 | Environment Variable | Default Value | Description |
 |----------------------|---------------|-------------|
-| `KINTSUTECH_API_KEY` | *(None / Unset)* | Secret key for authenticating protected mutation endpoints. Never hardcoded or logged. |
-| `KINTSUTECH_REQUIRE_AUTH` | `false` | When `true`, strictly enforces API-key authentication even in non-production environments. |
-| `ENVIRONMENT` | `development` | Deployment environment (`development` / `production`). If `production`, API key authentication is strictly required and fails safely (401) if `KINTSUTECH_API_KEY` is unset. |
-| `KINTSUTECH_WEBHOOK_SECRET` | *(Random 32-byte hex at startup)* | HMAC-SHA256 signing secret for webhooks. If unset, generates a dynamic runtime key. |
+| `ENVIRONMENT` | `development` | Deployment environment (`development` / `production`). In `production`, startup fails-closed if required secrets or safe configurations are missing. |
+| `KINTSUTECH_API_KEY` | *(None / Unset)* | Secret key for authenticating mutation and MCP tools. Required in `production` (>= 16 characters). Never hardcoded or logged. |
+| `KINTSUTECH_REQUIRE_AUTH` | `false` | When `true`, strictly enforces API-key authentication even in development. |
+| `KINTSUTECH_WEBHOOK_SECRET` | *(Random 32-byte hex at startup)* | HMAC-SHA256 signing secret for webhooks. In `production`, must be explicitly configured (>= 16 characters). |
+| `FRONTEND_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Allowed CORS origins (comma-separated). In `production`, must be explicitly configured without wildcards (`*`). |
+| `MAX_REQUEST_BODY_SIZE` | `1048576` (1 MB) | Maximum accepted request payload size in bytes. Oversized payloads return HTTP 413. |
+| `KINTSUTECH_RATE_LIMIT_ENABLED` | `true` | When `true`, enforces in-memory sliding-window rate limiting on sensitive endpoints. |
+| `RATE_LIMIT_MUTATION_PER_MINUTE` | `60` | Request rate limit per minute per client IP for mutations and admin routes. Returns HTTP 429 with `Retry-After`. |
+| `RATE_LIMIT_WEBHOOK_INGEST_PER_MINUTE` | `120` | Request rate limit per minute per client IP for incoming webhook ingestion. |
+| `KINTSUTECH_TRUST_PROXY` | `false` | When `true`, extracts client IP from `X-Forwarded-For` / `X-Real-IP`. Keep `false` unless running behind a trusted reverse proxy. |
 | `WEATHER_PROVIDER_URL` | `http://127.0.0.1:8000/api/v1/mock/weather` | Upstream target URL for the weather service |
 | `KINTSUTECH_DATABASE_URL` | `sqlite:///backend/data/kintsutech.db` | SQLite persistence database location |
-| `FRONTEND_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | Allowed CORS origins for frontend UI |
 
 ### Authenticated Request Examples
 
@@ -295,7 +300,7 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/webhooks/subscriptions \
 Run all test suites across the project:
 
 ```bash
-# 1. Run backend tests (148 tests)
+# 1. Run backend tests (175 tests)
 cd backend && uv run pytest -q
 
 # 2. Run AI engine tests (88 tests)
@@ -305,14 +310,164 @@ cd ../ai_engine && uv run pytest -q
 cd backend && uv run python -m compileall -q app tests && cd ../ai_engine && uv run python -m compileall -q -x "\.venv" .
 ```
 
-**Total automated tests:** **236 passed** (148 backend + 88 AI engine).
+**Total automated tests:** **263 passed** (175 backend + 88 AI engine).
 
 ---
 
-## 5. System Limitations & Safety Principles
+## 5. Genuine Model Context Protocol (MCP) Implementation (Phase 5D)
+
+KintsuTech implements genuine **Model Context Protocol (MCP)** support using the official Python MCP SDK (`mcp>=2.3.0`), rejecting hand-rolled fake JSON-RPC endpoints. It exposes rich, guarded tools to AI agents, Claude Desktop, Cursor, or autonomous systems over both **Streamable HTTP** and **stdio** transports.
+
+### Transports & Connectivity
+
+1. **Hosted Streamable HTTP Transport (Recommended)**:
+   - Mounted directly inside the FastAPI application at `/mcp` (and `/api/v1/mcp/stream`).
+   - Accessible at `http://127.0.0.1:8000/mcp/`.
+   - Supports bi-directional streaming, session lifecycle management, and JSON-RPC message framing via `mcp.client.streamable_http.streamable_http_client`.
+
+2. **stdio Transport (Local Subprocess / CLI)**:
+   - Run the standalone MCP server process over standard input/output:
+   ```bash
+   cd backend
+   uv run python -m app.mcp_server
+   ```
+
+3. **Backward-Compatible REST Endpoints**:
+   - `GET /api/v1/mcp/tools`: Returns the complete tool catalog with JSON-schema input definitions.
+   - `POST /api/v1/mcp/tools/call`: Executes tools through the REST bridge with automated API-key header propagation.
+
+### Available MCP Tools Catalog
+
+| Tool Name | Type | Description | Required Arguments |
+|-----------|------|-------------|--------------------|
+| `list_services` | Read-only | List all monitored services, baselines, and active adapters | None |
+| `get_service_baseline` | Read-only | Retrieve versioned baseline response for a service | `service_id` |
+| `analyze_service_changes` | Read-only | Deterministic diff and AI-assisted change analysis | `service_id`, `baseline`, `current` |
+| `calculate_dependency_impact` | Read-only | Calculate blast radius and downstream dependents via NetworkX | `service_id` |
+| `list_incidents` | Read-only | List recorded incidents filtered by status or service | Optional `service_id`, `status` |
+| `get_incident_evidence` | Read-only | Inspect comprehensive evidence and structural diffs | `incident_id` |
+| `list_consumer_contracts` | Read-only | List registered downstream consumer contracts & schemas | Optional `service_id` |
+| `validate_repair_proposal` | Non-mutating | Deterministically validate adapter without mutating state | `incident_id`, `adapter`, optional `test_cases`, `consumer_contracts` |
+| `request_repair_activation` | Mutating (Guarded) | Safely activate validated adapter; checks auth, adapter hash, and contract version | `incident_id`, `adapter`, `authorizer`, `api_key` (if auth enforced) |
+| `request_rollback` | Mutating (Guarded) | Deactivate active adapter and restore un-adapted state | `service_id`, `authorizer`, `api_key` (if auth enforced) |
+
+### MCP Client Configuration Examples
+
+#### Python MCP Client (Streamable HTTP)
+```python
+import asyncio
+import httpx2
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+async def main():
+    async with httpx2.AsyncClient(base_url="http://127.0.0.1:8000") as http_client:
+        async with streamable_http_client("http://127.0.0.1:8000/mcp/", http_client=http_client) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                print("Available tools:", [t.name for t in tools.tools])
+
+                # Execute read-only impact analysis
+                res = await session.call_tool("calculate_dependency_impact", {"service_id": "weather"})
+                print("Tool output:", res.content[0].text)
+
+asyncio.run(main())
+```
+
+#### Claude Desktop Configuration (`claude_desktop_config.json`)
+```json
+{
+  "mcpServers": {
+    "kintsutech": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/Users/yash/PROJECTS/HackWave3.0/KintsuTech/backend",
+        "run",
+        "python",
+        "-m",
+        "app.mcp_server"
+      ]
+    }
+  }
+}
+```
+
+### Security & Integrity Enforcement in MCP
+
+- **Guarded Mutating Tools**: `request_repair_activation` and `request_rollback` strictly verify credentials (`api_key`) via constant-time comparison when authentication is configured.
+- **Canonical Adapter Hash Verification**: Activation computes the canonical SHA-256 hash of the incoming adapter configuration and verifies that it exactly matches the independently validated adapter, blocking post-validation parameter tampering.
+- **Contract Version Matching**: Ensures the adapter adheres to the consumer contract version verified during validation.
+- **Zero Credential Leakage**: Tool results and error payloads never expose API keys, webhook secrets, or environment credentials.
+
+---
+
+## 6. System Limitations & Safety Principles
 
 1. **Deterministic Guardrails**: KintsuTech never promotes an AI-proposed adapter directly to production without passing deterministic test cases.
 2. **Explicit Human Authorization**: Every activation and rollback requires an authenticated authorizer name and audit entry.
-3. **Semantic Equivalence Guard**: Adapters currently support restricted, safe `copy_field` semantics. Field mappings cannot silently assume unit equivalence (e.g. Celsius vs Fahrenheit) without explicit reviewer confirmation.
+3. **Semantic Equivalence Guard**: Adapters currently support restricted, safe `copy_field` and `convert_units` semantics. Field mappings cannot silently assume unit equivalence (e.g. Celsius vs Fahrenheit) without explicit reviewer confirmation.
 4. **Controlled Upstream Proxy**: KintsuTech only adapts traffic explicitly routed through its proxy endpoints. It does not claim arbitrary network interception.
 5. **Timeout Safety**: Upstream requests enforce 2.0s connect and 5.0s read timeouts, mapping to HTTP 504 and 502 rather than hanging worker processes.
+
+---
+
+## 7. Production Deployment Hardening (Phase 5E)
+
+### Fail-Closed Security Configuration
+- When `ENVIRONMENT=production`, KintsuTech validates all security parameters at startup:
+  - `KINTSUTECH_API_KEY`: Must be configured, at least 16 characters, and not in the trivial blacklist. Startup is aborted immediately if missing or weak.
+  - `KINTSUTECH_WEBHOOK_SECRET`: Must be explicitly configured and at least 16 characters.
+  - `FRONTEND_ORIGINS`: Must be an explicit list of origins. Wildcards (`*`) are strictly forbidden.
+- Local development (`ENVIRONMENT=development`) remains convenient without weakening production defaults.
+
+### Request Protection, Rate Limiting & Proxy Trust
+- **Bounded Request Body Size**: Implemented as pure ASGI `BoundedBodyLimitMiddleware`. Configurable via `MAX_REQUEST_BODY_SIZE` (default: 1,048,576 bytes = 1 MB). Enforces limits on requests both with `Content-Length` headers and chunked/streamed requests (`Transfer-Encoding: chunked`), preventing memory exhaustion and bypassing across all routes and mounted MCP endpoints. Oversized requests return HTTP 413 (Payload Too Large). Malformed headers return HTTP 400.
+- **Sliding-Window Rate Limiting (Per-Process)**: In-memory thread-safe rate limiter tracks client requests. Sensitive mutation endpoints (`/services/{service_id}`, `/services/{service_id}/baseline`, `/repairs/validate`, `/repairs/activate`, `/repairs/rollback`, `/contracts`, `/webhooks/subscriptions`, `/mcp/tools/call`) enforce 60 req/min; webhook ingestion (`/webhooks/incoming`) enforces 120 req/min. Exceeded limits return HTTP 429 with a standard `Retry-After` header.
+  - *Architecture Note:* The sliding-window rate limiter is **in-memory and per-process**. In multi-worker or horizontally scaled multi-pod architectures, a centralized caching backend (e.g., Redis) should back rate limiting.
+- **Reverse Proxy Header Trust**: By default, `X-Forwarded-For` and `X-Real-IP` headers are ignored to prevent IP spoofing attacks. Set `KINTSUTECH_TRUST_PROXY=true` only when running behind an authenticated reverse proxy (e.g., NGINX, Cloudflare).
+
+### Storage Architecture & Lifecycle Reliability
+- **SQLite Concurrency**: SQLite runs with WAL mode (`PRAGMA journal_mode=WAL`) and a 5,000ms busy timeout.
+- **Resource Lifecycle**: The FastAPI `lifespan` manager guarantees clean startup and shutdown:
+  - MCP session manager lifecycle states (`_has_started`) are tracked and reset safely, permitting repeated startup/shutdown cycles without resource collision.
+  - Background webhook thread pools are gracefully flushed, and auto-reinitialize if invoked post-shutdown.
+  - SQLAlchemy database connection pool engines are disposed cleanly via `storage_registry.close()`.
+- **Persistence Limitations**:
+  - SQLite storage requires a persistent volume mount (`/app/data`) in containerized environments.
+  - SQLite supports single-pod deployments. Multi-pod horizontal scaling requires an external PostgreSQL database via `KINTSUTECH_DATABASE_URL`.
+  - Background webhook dispatch is in-process and best-effort; in-flight tasks do not survive sudden process crashes or host termination.
+
+### Docker Container Deployment
+
+A multi-stage, unprivileged production Dockerfile is provided in [`backend/Dockerfile`](file:///Users/yash/PROJECTS/HackWave3.0/KintsuTech/backend/Dockerfile):
+
+```bash
+# 1. Build the production container (from repository root)
+docker build -f backend/Dockerfile -t kintsutech-backend:latest .
+
+# 2. Run the container with persistent storage and environment file
+docker run -d \
+  -p 8000:8000 \
+  -v $(pwd)/backend/data:/app/data \
+  --env-file backend/.env \
+  --name kintsutech-api \
+  kintsutech-backend:latest
+```
+
+- **Runtime User**: Runs as unprivileged user `kintsu:kintsu` (UID/GID isolated).
+- **Health Check**: Automated periodic health checks via standard library `urllib` targeting `/api/v1/health`.
+- **Single-Worker Default**: Defaults to 1 worker process with Uvicorn to ensure safe SQLite write concurrency.
+- *Host Note:* Docker daemon was unavailable on the local audit machine (`docker not found`), so the container image build was verified structurally (Dockerfile + `.dockerignore`) rather than built live.
+
+### Securing MCP Endpoints
+
+- Hosted **Streamable HTTP transport** is available at `http://127.0.0.1:8000/mcp/` and `/api/v1/mcp/stream`.
+- Read-only tools (`list_services`, `get_service_baseline`, `calculate_dependency_impact`, `list_incidents`, `list_consumer_contracts`) allow safe introspection without authentication.
+- Mutating tools (`request_repair_activation`, `request_rollback`) strictly enforce:
+  1. **HTTP Transport Header Authentication**: For remote HTTP callers, credentials must be provided via HTTP headers (`X-API-Key` or `Authorization: Bearer <key>`) and verified via `Context.headers`. The server does NOT rely on a client-supplied `api_key` tool argument alone for remote calls.
+  2. **stdio Transport Fallback**: When called in local stdio subprocess mode or direct in-process calls (`ctx.headers` is None), the `api_key` tool argument is accepted as a fallback.
+  3. **Canonical SHA-256 Adapter Hash Verification**: Activation computes the canonical SHA-256 hash of the incoming adapter configuration and verifies that it exactly matches the independently validated adapter, blocking post-validation parameter tampering.
+  4. **Consumer Contract Version Matching**: Ensures the adapter adheres to the consumer contract version verified during validation.
+- Tool responses and error payloads never leak internal environment variables, API keys, or webhook signing secrets.

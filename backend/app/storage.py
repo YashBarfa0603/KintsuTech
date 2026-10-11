@@ -1000,6 +1000,12 @@ class StorageRegistry:
                 session.execute(delete(WebhookIdempotencyModel))
                 session.commit()
 
+    def close(self) -> None:
+        """Dispose database engine and close active connections."""
+        with self._lock:
+            if hasattr(self, "_engine") and self._engine:
+                self._engine.dispose()
+
 
 # Singleton instance for backend use
 storage_registry = StorageRegistry(db_url=get_default_db_url())

@@ -1,3 +1,5 @@
+from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -8,9 +10,13 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app.security import verify_api_key
+from app.security import validate_production_config, verify_api_key
+from app.rate_limiter import rate_limit_mutations, rate_limit_webhooks
 
 from app.ai_adapter import AIAdapter
 from app.ai_adapter import analyze_changes as analyze_with_adapter
@@ -39,7 +45,12 @@ from consumer_contracts import contract_registry
 from repair_validator import validate_repair
 
 from app.dependency_graph import create_default_dependency_graph
-from app.mcp_server import call_mcp_tool, list_mcp_tools
+from app.mcp_server import (
+    call_mcp_tool,
+    list_mcp_tools,
+    mcp_server,
+    mcp_streamable_app,
+)
 from app.provider_client import (
     ProviderConnectionError,
     ProviderResponseError,
@@ -121,11 +132,135 @@ class MCPToolCallRequest(BaseModel):
     arguments: dict[str, Any] = {}
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Fail-closed production configuration validation
+    validate_production_config()
+
+    # 2. Startup MCP server session manager
+    mcp_cm = None
+    if hasattr(mcp_server, "session_manager") and mcp_server.session_manager:
+        mcp_server.session_manager._has_started = False
+        mcp_cm = mcp_server.session_manager.run()
+        await mcp_cm.__aenter__()
+
+    try:
+        yield
+    finally:
+        # 3. Graceful shutdown of MCP session manager
+        if mcp_cm:
+            try:
+                await mcp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            if hasattr(mcp_server, "session_manager") and mcp_server.session_manager:
+                mcp_server.session_manager._has_started = False
+
+        # 4. Graceful shutdown of background webhook workers
+        try:
+            webhook_manager.shutdown(wait=False)
+        except Exception:
+            pass
+
+        # 5. Dispose database engine
+        try:
+            storage_registry.close()
+        except Exception:
+            pass
+
+
+class BoundedBodyLimitMiddleware:
+    """
+    Pure ASGI middleware enforcing MAX_REQUEST_BODY_SIZE.
+    Protects both standard Content-Length requests and streaming/chunked requests
+    without a trustworthy Content-Length header, avoiding unbounded memory buffering.
+    Compatible with FastAPI and mounted MCP Streamable HTTP transport.
+    """
+
+    def __init__(self, app: ASGIApp, default_max_size: int = 1048576) -> None:
+        self.app = app
+        self.default_max_size = default_max_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            max_size = int(os.environ.get("MAX_REQUEST_BODY_SIZE", str(self.default_max_size)))
+        except ValueError:
+            max_size = self.default_max_size
+
+        headers = Headers(scope=scope)
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+                if declared_size > max_size:
+                    resp = JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"Request entity too large ({declared_size} bytes exceeds limit of {max_size} bytes)."
+                        },
+                    )
+                    return await resp(scope, receive, send)
+            except ValueError:
+                resp = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
+                return await resp(scope, receive, send)
+
+        received_body = bytearray()
+        received_request = False
+        body_complete = False
+        trailing_message: Message | None = None
+
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                trailing_message = message
+                break
+
+            received_request = True
+            body = message.get("body", b"")
+            if len(received_body) + len(body) > max_size:
+                resp = JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": f"Request entity too large ({len(received_body) + len(body)} bytes exceeds limit of {max_size} bytes)."
+                    },
+                )
+                return await resp(scope, receive, send)
+
+            received_body.extend(body)
+            if not message.get("more_body", False):
+                body_complete = True
+                break
+
+        cached_messages: deque[Message] = deque()
+        if received_request:
+            cached_messages.append(
+                {"type": "http.request", "body": bytes(received_body), "more_body": not body_complete}
+            )
+        if trailing_message is not None:
+            cached_messages.append(trailing_message)
+
+        async def replay() -> Message:
+            if cached_messages:
+                return cached_messages.popleft()
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
 app = FastAPI(
     title="KintsuTech",
     description="API change detection and resilience monitoring.",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+# Genuine Model Context Protocol (MCP) Streamable HTTP transport
+app.mount("/mcp", mcp_streamable_app)
+app.mount("/api/v1/mcp/stream", mcp_streamable_app)
 
 ai_adapter = AIAdapter(run_change_workflow)
 
@@ -135,6 +270,8 @@ FRONTEND_ORIGINS = os.environ.get(
 )
 allowed_origins = [origin.strip() for origin in FRONTEND_ORIGINS.split(",") if origin.strip()]
 
+MAX_REQUEST_BODY_SIZE = int(os.environ.get("MAX_REQUEST_BODY_SIZE", "1048576"))  # default 1MB
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -142,6 +279,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BoundedBodyLimitMiddleware, default_max_size=MAX_REQUEST_BODY_SIZE)
 
 observer = APIObserver()
 health_monitor = APIHealthMonitor()
@@ -500,7 +638,10 @@ def list_services():
     return {"services": storage_registry.list_services()}
 
 
-@app.post("/api/v1/services/{service_id}")
+@app.post(
+    "/api/v1/services/{service_id}",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def register_service(
     service_id: str,
     payload: ServiceRegisterRequest,
@@ -541,7 +682,10 @@ def get_service_baseline(service_id: str):
     return {"baseline": baseline}
 
 
-@app.post("/api/v1/services/{service_id}/baseline")
+@app.post(
+    "/api/v1/services/{service_id}/baseline",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def save_service_baseline(
     service_id: str,
     payload: BaselineSaveRequest,
@@ -603,7 +747,10 @@ def get_incident_by_id(incident_id: str):
 # Repair Validation, Guarded Activation & Rollback
 
 
-@app.post("/api/v1/repairs/validate")
+@app.post(
+    "/api/v1/repairs/validate",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def validate_repair_proposal(payload: RepairValidationRequest):
     """
     Deterministically validate a proposed compatibility adapter using test cases
@@ -654,7 +801,10 @@ def validate_repair_proposal(payload: RepairValidationRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/repairs/activate")
+@app.post(
+    "/api/v1/repairs/activate",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def activate_repair(
     payload: RepairActivationRequest,
     auth_user: str = Depends(verify_api_key),
@@ -697,7 +847,10 @@ def list_consumer_contracts(service_id: str | None = Query(default=None)):
     return {"contracts": contract_registry.list_all()}
 
 
-@app.post("/api/v1/contracts")
+@app.post(
+    "/api/v1/contracts",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def register_consumer_contract(
     payload: ConsumerContractRequest,
     auth_user: str = Depends(verify_api_key),
@@ -710,7 +863,10 @@ def register_consumer_contract(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/repairs/rollback")
+@app.post(
+    "/api/v1/repairs/rollback",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def rollback_repair(
     payload: RepairRollbackRequest,
     auth_user: str = Depends(verify_api_key),
@@ -749,7 +905,10 @@ def get_repair_audit_log():
 # Webhooks (Incoming Receiver & Outgoing Subscriptions)
 
 
-@app.post("/api/v1/webhooks/incoming")
+@app.post(
+    "/api/v1/webhooks/incoming",
+    dependencies=[Depends(rate_limit_webhooks)],
+)
 async def receive_incoming_webhook(request: Request):
     """
     Receive incoming webhooks with HMAC-SHA256 signature verification,
@@ -792,7 +951,10 @@ async def receive_incoming_webhook(request: Request):
     }
 
 
-@app.post("/api/v1/webhooks/subscriptions")
+@app.post(
+    "/api/v1/webhooks/subscriptions",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def create_webhook_subscription(
     payload: WebhookSubscriptionRequest,
     auth_user: str = Depends(verify_api_key),
@@ -849,13 +1011,27 @@ def get_mcp_tools():
     return {"tools": list_mcp_tools()}
 
 
-@app.post("/api/v1/mcp/tools/call")
+@app.post(
+    "/api/v1/mcp/tools/call",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def execute_mcp_tool(
     payload: MCPToolCallRequest,
+    request: Request,
     auth_user: str = Depends(verify_api_key),
 ):
     """Execute an MCP tool request against the backend services."""
-    result = call_mcp_tool(payload.name, payload.arguments)
+    args = dict(payload.arguments) if payload.arguments else {}
+    if "api_key" not in args:
+        header_key = request.headers.get("X-API-Key")
+        if not header_key:
+            auth_hdr = request.headers.get("Authorization", "")
+            if auth_hdr.startswith("Bearer "):
+                header_key = auth_hdr[7:].strip()
+        if header_key:
+            args["api_key"] = header_key
+
+    result = call_mcp_tool(payload.name, args)
     if "error" in result and result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return {"tool": payload.name, "result": result}
