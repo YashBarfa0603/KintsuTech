@@ -611,12 +611,85 @@ ollama serve
 # KINTSUTECH_TTS_MODEL_PATH=/path/to/en_US-lessac-medium.onnx
 ```
 
-### Telephony & Safety Requirements for Real Phone Calls
+### Telephony & Vapi Outbound Calling Integration
 
-Outbound PSTN telephone calls are **strictly disabled** (`KINTSUTECH_TELEPHONY_ENABLED=false`).
-To enable real phone calls in a production deployment, the following are required:
-1. **PSTN Gateway Integration**: An enterprise telephony provider (Twilio Voice API, Amazon Connect, or SIP Trunking) with verified outbound Caller ID numbers.
-2. **Explicit User Consent**: User must actively opt in and verify phone ownership via SMS/voice OTP challenge.
-3. **Opt-Out Compliance**: Mandatory adherence to TCPA/telecom regulations including immediate opt-out support.
-4. **Quiet Hours Enforcement**: Prohibit automated phone calls during legal quiet hours (9:00 PM to 8:00 AM recipient local time) unless explicitly classified as a verified life-safety emergency.
-5. **Call Rate & Cost Limits**: Enforce bounded retries (maximum 2 calls per incident) to prevent cascading toll fraud or call storms.
+KintsuTech integrates with the official **Vapi Outbound Calling REST API** (`POST https://api.vapi.ai/call/phone`) to escalate critical unacknowledged alerts to responsible on-call engineers.
+
+#### Outbound Calling Lifecycle & Safety Rules
+
+1. **Safety Default**: Outbound telephone calls are **strictly disabled by default** (`KINTSUTECH_TELEPHONY_ENABLED=false`). Automated tests always run with mocked providers and never initiate real phone calls.
+2. **Escalation Trigger**: When an alert remains unacknowledged past its acknowledgment deadline:
+   - The scheduler atomically acquires a distributed lease (`claim_due_alerts`).
+   - The scheduler checks recipient preferences: explicit `phone_consent` must be `true`, `phone_number` must be valid E.164, and the user must not be in quiet hours (unless critical emergency).
+   - If previous call attempts have reached `max_attempts` or an active call is already `queued`/`in-progress`, the call is safely skipped (idempotent & bounded).
+3. **Outbound Vapi Call**: The backend issues an authenticated request to `POST /call/phone`:
+   - Passes `assistantId` and `phoneNumberId` (imported number; Vapi free numbers do not support outbound calls).
+   - Passes a **privacy-conscious alert summary** via `assistantOverrides.variableValues` (alert ID, title, severity, incident ID; no internal secrets).
+   - Persists the returned `call_id` and initial status (`queued`) in `AlertDeliveryModel` and alert metadata.
+4. **Verified Canonical Webhook Processing**:
+   - Vapi sends status updates and end-of-call reports to the canonical endpoint: `POST /api/vapi/webhook`.
+   - The endpoint verifies the Bearer token or `x-vapi-secret` header using constant-time comparison against `KINTSUTECH_VAPI_WEBHOOK_TOKEN` (or `VAPI_WEBHOOK_SECRET`).
+   - Duplicate webhook deliveries are handled idempotently via `webhook_idempotency` tracking.
+   - Call duration, status (`in-progress`, `ended`, `completed`), and ended reasons are recorded without storing raw audio or personal info.
+   - If the call results in user acknowledgment (`assistant-acknowledged-alert` or `customer-acknowledged`), the alert status is automatically transitioned to `acknowledged`, terminating further escalation.
+
+#### Environment Configuration (`backend/.env`)
+
+```bash
+KINTSUTECH_TELEPHONY_ENABLED=false
+KINTSUTECH_TELEPHONY_PROVIDER=vapi
+VAPI_API_KEY=your-vapi-private-api-key
+VAPI_ASSISTANT_ID=your-vapi-assistant-uuid
+VAPI_PHONE_NUMBER_ID=your-vapi-phone-number-uuid
+KINTSUTECH_VAPI_WEBHOOK_TOKEN=your-webhook-secret-token
+VAPI_BASE_URL=https://api.vapi.ai
+VAPI_REQUEST_TIMEOUT_SECONDS=10.0
+```
+
+#### Local Webhook Testing Command
+
+```bash
+# Test local canonical webhook endpoint (authenticated via Bearer token):
+curl -i -X POST http://localhost:8000/api/vapi/webhook \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <YOUR_WEBHOOK_TOKEN>" \
+  -d '{"message":{"type":"status-update","call":{"id":"local-test","status":"in-progress"}}}'
+```
+
+#### Manual Live-Call Verification Procedure
+
+To test a live outbound phone call without waiting for automated escalation timeouts:
+
+```bash
+# 1. Start the backend server
+cd backend
+uv run uvicorn app.main:app --port 8000 --reload
+
+# 2. Check telephony readiness (should report ready: true once credentials are set)
+curl -s http://127.0.0.1:8000/api/v1/telephony/status | jq .
+
+# 3. Authenticate and update your test user alert preferences with phone consent
+curl -X PUT http://127.0.0.1:8000/api/v1/alert-preferences \
+  -H "Authorization: Bearer <SUPABASE_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone_consent": true,
+    "phone_number": "+1XXXXXXXXXX",
+    "channels": ["in_app", "phone"]
+  }'
+
+# 4. Create an urgent alert with delivery_channel: "phone"
+curl -X POST http://127.0.0.1:8000/api/v1/alerts \
+  -H "Authorization: Bearer <SUPABASE_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Manual Test Call",
+    "message": "Testing Vapi automated voice escalation",
+    "severity": "critical",
+    "delivery_channel": "phone"
+  }'
+
+# 5. Check call history to inspect Vapi Call ID and status
+curl -s http://127.0.0.1:8000/api/v1/alerts/<ALERT_ID>/history \
+  -H "Authorization: Bearer <SUPABASE_TOKEN>" | jq .
+```

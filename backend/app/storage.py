@@ -1364,6 +1364,8 @@ class StorageRegistry:
                 session.commit()
                 return False
 
+    check_and_record_webhook_event = is_duplicate_webhook_event
+
     # --- Alert Registry Operations ---
 
     def create_alert(
@@ -1851,7 +1853,106 @@ class StorageRegistry:
                 session.commit()
                 return _format_preference(pref)
 
+    def update_alert_metadata(
+        self,
+        alert_id: str,
+        metadata_updates: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Update or merge metadata on an existing alert."""
+        with self._lock:
+            with self._get_session() as session:
+                alert = session.get(AlertModel, alert_id)
+                if not alert:
+                    return None
+                current_meta = {}
+                if alert.metadata_json:
+                    try:
+                        current_meta = json.loads(alert.metadata_json)
+                    except Exception:
+                        current_meta = {}
+                current_meta.update(metadata_updates)
+                alert.metadata_json = json.dumps(current_meta)
+                alert.updated_at = datetime.now(timezone.utc).isoformat()
+                session.commit()
+                return _format_alert(alert)
+
+    def find_alert_by_call_id(self, call_id: str) -> dict[str, Any] | None:
+        """Find an alert linked to a Vapi phone call ID."""
+        if not call_id:
+            return None
+        with self._lock:
+            with self._get_session() as session:
+                deliveries = session.scalars(
+                    select(AlertDeliveryModel)
+                    .where(AlertDeliveryModel.channel == "phone")
+                    .order_by(AlertDeliveryModel.timestamp.desc())
+                ).all()
+                for d in deliveries:
+                    if d.details_json and f'"{call_id}"' in d.details_json:
+                        alert = session.get(AlertModel, d.alert_id)
+                        if alert:
+                            return _format_alert(alert)
+
+                alerts = session.scalars(
+                    select(AlertModel).where(AlertModel.metadata_json.is_not(None))
+                ).all()
+                for a in alerts:
+                    if a.metadata_json and f'"{call_id}"' in a.metadata_json:
+                        return _format_alert(a)
+                return None
+
+    def find_delivery_by_call_id(self, call_id: str) -> dict[str, Any] | None:
+        """Find an alert delivery record linked to a Vapi call ID."""
+        if not call_id:
+            return None
+        with self._lock:
+            with self._get_session() as session:
+                deliveries = session.scalars(
+                    select(AlertDeliveryModel)
+                    .where(AlertDeliveryModel.channel == "phone")
+                    .order_by(AlertDeliveryModel.timestamp.desc())
+                ).all()
+                for d in deliveries:
+                    if d.details_json and f'"{call_id}"' in d.details_json:
+                        return _format_delivery(d)
+                return None
+
+    def update_delivery_by_call_id(
+        self,
+        call_id: str,
+        *,
+        status: str,
+        details: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update existing delivery record associated with call_id."""
+        if not call_id:
+            return None
+        with self._lock:
+            with self._get_session() as session:
+                deliveries = session.scalars(
+                    select(AlertDeliveryModel)
+                    .where(AlertDeliveryModel.channel == "phone")
+                    .order_by(AlertDeliveryModel.timestamp.desc())
+                ).all()
+                for d in deliveries:
+                    if d.details_json and f'"{call_id}"' in d.details_json:
+                        d.status = status
+                        if error:
+                            d.error = error
+                        if details:
+                            try:
+                                existing = json.loads(d.details_json) if d.details_json else {}
+                            except Exception:
+                                existing = {}
+                            existing.update(details)
+                            d.details_json = json.dumps(existing)
+                        session.commit()
+                        return _format_delivery(d)
+                return None
+
     def reset(self) -> None:
+
         """Utility to wipe all storage tables (useful for isolated tests)."""
         with self._lock:
             with self._get_session() as session:

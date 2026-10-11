@@ -101,6 +101,15 @@ from app.voice import (
     voice_stt,
     voice_tts,
 )
+from app.vapi import (
+    VapiConfig,
+    vapi_service,
+    vapi_service as telephony_service,
+    verify_vapi_webhook_signature,
+    verify_vapi_webhook_token,
+    validate_phone_number,
+)
+
 
 
 
@@ -1747,7 +1756,7 @@ def voice_synthesize_endpoint(
 
 @app.get("/api/v1/voice/status")
 def voice_status_endpoint():
-    """Report readiness status of local voice agent components."""
+    """Report readiness status of local voice agent and telephony components."""
     return {
         "stt": {
             "engine": "mlx-whisper",
@@ -1766,9 +1775,58 @@ def voice_status_endpoint():
             "enabled": voice_tts.enabled,
             "model_path": voice_tts.model_path,
         },
-        "telephony": {
-            "enabled": os.environ.get("KINTSUTECH_TELEPHONY_ENABLED", "false").lower() in ("true", "1"),
-            "provider": "pstn-disabled",
-        },
+        "telephony": VapiConfig.get_readiness_report(),
     }
+
+
+# ============================================================================
+# Telephony (Vapi Outbound Calling) Endpoints
+# ============================================================================
+
+@app.get("/api/v1/telephony/status")
+def telephony_status_endpoint():
+    """Report Vapi telephony readiness and configuration status."""
+    return VapiConfig.get_readiness_report()
+
+
+@app.post(
+    "/api/vapi/webhook",
+    summary="Vapi Webhook Endpoint",
+    description="Canonical webhook endpoint for Vapi call lifecycle events and end-of-call reports.",
+    tags=["telephony", "vapi"],
+)
+@app.post(
+    "/api/v1/telephony/vapi/webhook",
+    include_in_schema=False,
+)
+async def vapi_webhook_endpoint(request: Request):
+    """
+    Handle official Vapi call status updates and end-of-call reports.
+    Enforces webhook secret authentication token verification.
+    """
+    headers = dict(request.headers)
+    body = await request.body()
+
+    if not verify_vapi_webhook_token(headers):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: invalid or missing Vapi webhook authentication token.",
+        )
+
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed JSON in webhook body.",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Malformed JSON: webhook payload must be a JSON object.",
+        )
+
+    result = vapi_service.process_webhook_callback(payload)
+    return {"status": "ok", "result": result}
 

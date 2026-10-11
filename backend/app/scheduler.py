@@ -94,11 +94,28 @@ class AlertScheduler:
             now_iso=current_iso,
         )
 
+        # 3. For unacknowledged escalated alerts with phone consent, initiate Vapi call
+        calls_dispatched = 0
+        for alert in escalated_alerts:
+            if alert["status"] in ("acknowledged", "resolved", "cancelled"):
+                continue
+            user_id = alert["user_id"]
+            pref = self.storage.get_alert_preferences(user_id)
+            if pref.get("phone_consent") and pref.get("phone_number"):
+                channels = pref.get("channels", [])
+                if "phone" in channels or alert.get("severity") in ("critical", "high"):
+                    from app.vapi import vapi_service
+                    call_res = vapi_service.dispatch_escalation_call(alert)
+                    if call_res.get("status") == "initiated":
+                        calls_dispatched += 1
+
         return {
             "claimed": len(claimed_alerts),
             "processed": processed_count,
             "escalated": len(escalated_alerts),
+            "calls_dispatched": calls_dispatched,
         }
+
 
     async def _worker_loop(self) -> None:
         """Internal asynchronous loop polling at configured interval."""

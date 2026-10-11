@@ -213,17 +213,20 @@ class AlertService:
         user_id = alert["user_id"]
         pref = preferences or self.storage.get_alert_preferences(user_id)
 
-        # Telephony safety check
+        # Telephony channel dispatch via Vapi
         if target_channel in ("phone", "telephony", "pstn"):
-            telephony_enabled = os.environ.get("KINTSUTECH_TELEPHONY_ENABLED", "false").lower() in ("true", "1")
-            if not telephony_enabled or not pref.get("phone_consent") or not pref.get("phone_number"):
-                return self.storage.record_delivery_attempt(
-                    alert["id"],
-                    channel="phone",
-                    status="failed",
-                    error="Telephony is disabled or recipient consent/phone number is unverified.",
-                    update_alert_status=False,
-                )
+            from app.vapi import vapi_service
+            res = vapi_service.dispatch_escalation_call(alert)
+            if res.get("delivery"):
+                return res["delivery"]
+            return self.storage.record_delivery_attempt(
+                alert["id"],
+                channel="phone",
+                status="skipped" if res.get("status") == "skipped" else "failed",
+                error=res.get("reason") or res.get("error", "Telephony call skipped or unconfigured"),
+                update_alert_status=False,
+            )
+
 
         if target_channel == "in_app":
             return self.storage.record_delivery_attempt(
