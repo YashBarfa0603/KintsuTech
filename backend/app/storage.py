@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from threading import Lock
 from typing import Any
+import uuid
 
 from sqlalchemy import (
     Boolean,
@@ -15,11 +16,15 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    event,
     func,
     select,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+
+from app.security import compute_adapter_hash
 
 
 # Base model for SQLAlchemy ORM
@@ -75,6 +80,8 @@ class ValidationModel(Base):
     validation_json = Column(Text, nullable=False)
     eligible_for_activation = Column(Boolean, nullable=False)
     tests_passed = Column(Integer, default=0)
+    adapter_hash = Column(String(64), nullable=True)
+    contract_version = Column(String(50), nullable=True)
     created_at = Column(String(50), nullable=False)
 
 
@@ -112,6 +119,40 @@ class UserModel(Base):
     user_metadata_json = Column(Text, default="{}")
     created_at = Column(String(50), nullable=False)
     updated_at = Column(String(50), nullable=False)
+
+
+class WebhookSubscriptionModel(Base):
+    __tablename__ = "webhook_subscriptions"
+
+    id = Column(String(50), primary_key=True)
+    target_url = Column(String(500), nullable=False)
+    events_json = Column(Text, nullable=False)
+    secret = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(String(50), nullable=False)
+
+
+class WebhookDeliveryModel(Base):
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(String(50), primary_key=True)
+    event_id = Column(String(50), index=True, nullable=True)
+    event_type = Column(String(100), nullable=False)
+    subscription_id = Column(String(50), index=True, nullable=False)
+    target_url = Column(String(500), nullable=False)
+    attempts = Column(Integer, default=1, nullable=False)
+    status = Column(String(50), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    timestamp = Column(String(50), nullable=False)
+
+
+class WebhookIdempotencyModel(Base):
+    __tablename__ = "webhook_idempotency"
+
+    event_id = Column(String(100), primary_key=True)
+    received_at = Column(String(50), nullable=False)
 
 
 # Default persistent file location outside source code
@@ -164,8 +205,37 @@ class StorageRegistry:
                     connect_args={"check_same_thread": False},
                 )
 
+        if "sqlite" in self._db_url:
+            @event.listens_for(self._engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("PRAGMA busy_timeout=5000")
+                except Exception:
+                    pass
+                cursor.close()
+
         Base.metadata.create_all(self._engine)
+        self._migrate_schema()
         self._session_factory = sessionmaker(bind=self._engine)
+
+    def _migrate_schema(self) -> None:
+        """Ensure schema compatibility for existing SQLite databases."""
+        Base.metadata.create_all(self._engine)
+        with self._engine.begin() as conn:
+            try:
+                result = conn.exec_driver_sql("PRAGMA table_info(validations)")
+                existing_cols = [row[1] for row in result.fetchall()]
+                if existing_cols and "adapter_hash" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE validations ADD COLUMN adapter_hash VARCHAR(64)")
+                if existing_cols and "contract_version" not in existing_cols:
+                    conn.exec_driver_sql("ALTER TABLE validations ADD COLUMN contract_version VARCHAR(50)")
+            except Exception:
+                pass
 
     def _get_session(self) -> Session:
         return self._session_factory()
@@ -493,6 +563,8 @@ class StorageRegistry:
         self,
         incident_id: str,
         validation_result: dict[str, Any],
+        adapter_config: dict[str, Any] | None = None,
+        contract_version: str | None = None,
     ) -> dict[str, Any]:
         """Record validation outcome for an incident's proposed repair."""
         with self._lock:
@@ -506,6 +578,19 @@ class StorageRegistry:
                 incident.status = "repair_validated" if eligible else "validation_rejected"
                 incident.updated_at = now_str
 
+                adapter_hash = None
+                if adapter_config:
+                    adapter_hash = compute_adapter_hash(adapter_config)
+                elif "adapter_hash" in validation_result:
+                    adapter_hash = validation_result["adapter_hash"]
+
+                if adapter_hash:
+                    validation_result["adapter_hash"] = adapter_hash
+
+                resolved_contract_version = contract_version or validation_result.get("contract_version")
+                if resolved_contract_version:
+                    validation_result["contract_version"] = resolved_contract_version
+
                 val_record = session.get(ValidationModel, incident_id)
                 if not val_record:
                     val_record = ValidationModel(
@@ -513,6 +598,8 @@ class StorageRegistry:
                         validation_json=json.dumps(validation_result),
                         eligible_for_activation=eligible,
                         tests_passed=int(validation_result.get("tests_passed", 0)),
+                        adapter_hash=adapter_hash,
+                        contract_version=resolved_contract_version,
                         created_at=now_str,
                     )
                     session.add(val_record)
@@ -520,6 +607,8 @@ class StorageRegistry:
                     val_record.validation_json = json.dumps(validation_result)
                     val_record.eligible_for_activation = eligible
                     val_record.tests_passed = int(validation_result.get("tests_passed", 0))
+                    val_record.adapter_hash = adapter_hash
+                    val_record.contract_version = resolved_contract_version
 
                 audit_event = {
                     "event": "repair_validated",
@@ -527,6 +616,8 @@ class StorageRegistry:
                     "service_id": incident.service_id,
                     "eligible": eligible,
                     "tests_passed": validation_result.get("tests_passed", 0),
+                    "adapter_hash": adapter_hash,
+                    "contract_version": resolved_contract_version,
                     "timestamp": now_str,
                 }
                 session.add(
@@ -560,10 +651,13 @@ class StorageRegistry:
         *,
         authorizer: str = "system",
         note: str = "",
+        contract_version: str | None = None,
     ) -> dict[str, Any]:
         """
         Guarded repair activation.
-        Requires that the proposed adapter was verified via validation.
+        Requires that the proposed adapter was verified via validation,
+        matches the exact validated adapter configuration hash,
+        and matches the validated contract version.
         """
         with self._lock:
             if not incident_id or not isinstance(incident_id, str) or not incident_id.strip():
@@ -579,6 +673,22 @@ class StorageRegistry:
                     raise ValueError(
                         f"Cannot activate repair for {incident_id}: "
                         "Repair has not passed independent validation."
+                    )
+
+                # Recompute requested adapter hash and verify binding to validated adapter
+                requested_hash = compute_adapter_hash(adapter_config)
+                if val.adapter_hash and val.adapter_hash != requested_hash:
+                    raise ValueError(
+                        f"Cannot activate repair for {incident_id}: "
+                        f"Requested adapter configuration does not match validated adapter. "
+                        f"Validated hash: '{val.adapter_hash}', requested hash: '{requested_hash}'."
+                    )
+
+                # Recheck contract version if provided
+                if contract_version and val.contract_version and val.contract_version != contract_version:
+                    raise ValueError(
+                        f"Cannot activate repair for {incident_id}: "
+                        f"Requested contract version '{contract_version}' does not match validated contract version '{val.contract_version}'."
                     )
 
                 now_str = datetime.now(timezone.utc).isoformat()
@@ -812,6 +922,175 @@ class StorageRegistry:
                     for u in users
                 ]
 
+    def create_webhook_subscription(
+        self,
+        sub: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a new or updated webhook subscription to SQLite."""
+        with self._lock:
+            with self._get_session() as session:
+                sub_id = sub["id"]
+                row = WebhookSubscriptionModel(
+                    id=sub_id,
+                    target_url=sub["target_url"],
+                    events_json=json.dumps(sub.get("events", ["*"])),
+                    secret=sub.get("secret", ""),
+                    description=sub.get("description", ""),
+                    is_active=sub.get("is_active", True),
+                    created_at=sub.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                )
+                session.merge(row)
+                session.commit()
+                return deepcopy(sub)
+
+    def list_webhook_subscriptions(
+        self,
+        include_secret: bool = False,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List persisted webhook subscriptions with optional secret redaction."""
+        with self._lock:
+            with self._get_session() as session:
+                stmt = select(WebhookSubscriptionModel)
+                if active_only:
+                    stmt = stmt.where(WebhookSubscriptionModel.is_active.is_(True))
+                stmt = stmt.order_by(WebhookSubscriptionModel.created_at.asc())
+                rows = session.scalars(stmt).all()
+                result = []
+                for r in rows:
+                    entry = {
+                        "id": r.id,
+                        "target_url": r.target_url,
+                        "events": json.loads(r.events_json),
+                        "description": r.description,
+                        "is_active": r.is_active,
+                        "created_at": r.created_at,
+                    }
+                    if include_secret:
+                        entry["secret"] = r.secret
+                    else:
+                        entry["secret_configured"] = bool(r.secret)
+                    result.append(entry)
+                return result
+
+    def get_webhook_subscription(
+        self,
+        sub_id: str,
+        include_secret: bool = False,
+    ) -> dict[str, Any] | None:
+        """Retrieve a specific webhook subscription."""
+        with self._lock:
+            with self._get_session() as session:
+                r = session.get(WebhookSubscriptionModel, sub_id)
+                if not r:
+                    return None
+                entry = {
+                    "id": r.id,
+                    "target_url": r.target_url,
+                    "events": json.loads(r.events_json),
+                    "description": r.description,
+                    "is_active": r.is_active,
+                    "created_at": r.created_at,
+                }
+                if include_secret:
+                    entry["secret"] = r.secret
+                else:
+                    entry["secret_configured"] = bool(r.secret)
+                return entry
+
+    def record_webhook_delivery(
+        self,
+        log_entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a webhook delivery attempt and status record to SQLite."""
+        with self._lock:
+            with self._get_session() as session:
+                del_id = log_entry.get("delivery_id") or f"del_{uuid.uuid4().hex[:12]}"
+                log_entry["delivery_id"] = del_id
+                now_str = log_entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
+                row = WebhookDeliveryModel(
+                    id=del_id,
+                    event_id=log_entry.get("event_id"),
+                    event_type=log_entry.get("event_type", "unknown"),
+                    subscription_id=log_entry.get("subscription_id", ""),
+                    target_url=log_entry.get("target_url", ""),
+                    attempts=int(log_entry.get("attempts", 1)),
+                    status=log_entry.get("status", "unknown"),
+                    status_code=log_entry.get("status_code"),
+                    error=log_entry.get("error"),
+                    timestamp=now_str,
+                )
+                session.add(row)
+                session.commit()
+                return deepcopy(log_entry)
+
+    def list_webhook_deliveries(
+        self,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve recent webhook delivery records in reverse chronological order."""
+        with self._lock:
+            with self._get_session() as session:
+                stmt = (
+                    select(WebhookDeliveryModel)
+                    .order_by(WebhookDeliveryModel.timestamp.desc())
+                    .limit(limit)
+                )
+                rows = session.scalars(stmt).all()
+                return [
+                    {
+                        "delivery_id": r.id,
+                        "event_id": r.event_id,
+                        "event_type": r.event_type,
+                        "subscription_id": r.subscription_id,
+                        "target_url": r.target_url,
+                        "attempts": r.attempts,
+                        "status": r.status,
+                        "status_code": r.status_code,
+                        "error": r.error,
+                        "timestamp": r.timestamp,
+                    }
+                    for r in rows
+                ]
+
+    def is_duplicate_webhook_event(
+        self,
+        event_id: str,
+        max_retention: int = 1000,
+    ) -> bool:
+        """
+        Check if an incoming webhook event has already been processed (idempotency).
+        Enforces a bounded retention limit by purging oldest records when exceeded.
+        """
+        if not event_id:
+            return False
+        with self._lock:
+            with self._get_session() as session:
+                exists = session.get(WebhookIdempotencyModel, str(event_id))
+                if exists:
+                    return True
+                now_str = datetime.now(timezone.utc).isoformat()
+                session.add(WebhookIdempotencyModel(event_id=str(event_id), received_at=now_str))
+
+                # Bounded retention policy: purge oldest if total entries exceed max_retention
+                total_count = session.scalar(select(func.count(WebhookIdempotencyModel.event_id)))
+                if total_count and total_count > max_retention:
+                    excess = total_count - max_retention
+                    subq = (
+                        select(WebhookIdempotencyModel.event_id)
+                        .order_by(WebhookIdempotencyModel.received_at.asc())
+                        .limit(excess)
+                    )
+                    old_ids = session.scalars(subq).all()
+                    if old_ids:
+                        session.execute(
+                            delete(WebhookIdempotencyModel).where(
+                                WebhookIdempotencyModel.event_id.in_(old_ids)
+                            )
+                        )
+                session.commit()
+                return False
+
     def reset(self) -> None:
         """Utility to wipe all storage tables (useful for isolated tests)."""
         with self._lock:
@@ -823,7 +1102,16 @@ class StorageRegistry:
                 session.execute(delete(ServiceModel))
                 session.execute(delete(AuditLogModel))
                 session.execute(delete(UserModel))
+                session.execute(delete(WebhookDeliveryModel))
+                session.execute(delete(WebhookSubscriptionModel))
+                session.execute(delete(WebhookIdempotencyModel))
                 session.commit()
+
+    def close(self) -> None:
+        """Dispose database engine and close active connections."""
+        with self._lock:
+            if hasattr(self, "_engine") and self._engine:
+                self._engine.dispose()
 
 
 

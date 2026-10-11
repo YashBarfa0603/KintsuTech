@@ -67,3 +67,21 @@ def mock_ollama_for_offline_tests(monkeypatch):
     except Exception:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def mock_weather_provider_for_offline_tests(monkeypatch):
+    """
+    Provide a mock weather provider response so proxy/weather tests run
+    cleanly offline without connecting to a real provider URL.
+    """
+    from app.provider_client import weather_provider_client
+    from app.mock_apis import get_weather_response
+
+    monkeypatch.setattr(
+        weather_provider_client,
+        "fetch_weather",
+        lambda params=None: dict(get_weather_response(1)),
+    )
+    yield
+

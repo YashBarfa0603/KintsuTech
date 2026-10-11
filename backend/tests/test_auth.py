@@ -153,15 +153,12 @@ def test_optional_current_user_returns_user_when_valid(monkeypatch):
     assert user.id == "opt-user-2"
 
 
-def test_unauthenticated_request_to_activate_returns_401():
+def test_unauthenticated_request_to_auth_me_returns_401():
     from app.main import app
     app.dependency_overrides.pop(get_current_user, None)
     from fastapi.testclient import TestClient
     client = TestClient(app)
-    response = client.post(
-        "/api/v1/repairs/activate",
-        json={"incident_id": "INC-001", "adapter": {}},
-    )
+    response = client.get("/api/v1/auth/me")
     assert response.status_code == 401
     assert "authentication required" in response.json()["detail"].lower()
 

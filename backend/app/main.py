@@ -1,3 +1,5 @@
+from collections import deque
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -8,7 +10,13 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from app.security import validate_production_config, verify_api_key
+from app.rate_limiter import rate_limit_mutations, rate_limit_webhooks
 
 from app.auth import (
     AuthenticatedUser,
@@ -48,10 +56,16 @@ if str(AI_ENGINE_PATH) not in sys.path:
     sys.path.insert(0, str(AI_ENGINE_PATH))
 
 from change_workflow import run_change_workflow
+from consumer_contracts import contract_registry
 from repair_validator import validate_repair
 
 from app.dependency_graph import create_default_dependency_graph
-from app.mcp_server import call_mcp_tool, list_mcp_tools
+from app.mcp_server import (
+    call_mcp_tool,
+    list_mcp_tools,
+    mcp_server,
+    mcp_streamable_app,
+)
 from app.provider_client import (
     ProviderConnectionError,
     ProviderResponseError,
@@ -93,6 +107,9 @@ class RepairValidationRequest(BaseModel):
     incident_id: str
     adapter: dict[str, Any]
     test_cases: list[dict[str, Any]]
+    consumer_contracts: list[dict[str, Any]] | None = None
+    service_id: str | None = None
+    required_consumers: list[str] | None = None
 
 
 class RepairActivationRequest(BaseModel):
@@ -100,6 +117,16 @@ class RepairActivationRequest(BaseModel):
     adapter: dict[str, Any]
     authorizer: str = "human_operator"
     note: str = ""
+    contract_version: str | None = None
+
+
+class ConsumerContractRequest(BaseModel):
+    consumer_id: str
+    service_id: str
+    version: str = "1.0"
+    mandatory: bool = True
+    fields: dict[str, Any]
+    description: str = ""
 
 
 class RepairRollbackRequest(BaseModel):
@@ -120,11 +147,135 @@ class MCPToolCallRequest(BaseModel):
     arguments: dict[str, Any] = {}
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Fail-closed production configuration validation
+    validate_production_config()
+
+    # 2. Startup MCP server session manager
+    mcp_cm = None
+    if hasattr(mcp_server, "session_manager") and mcp_server.session_manager:
+        mcp_server.session_manager._has_started = False
+        mcp_cm = mcp_server.session_manager.run()
+        await mcp_cm.__aenter__()
+
+    try:
+        yield
+    finally:
+        # 3. Graceful shutdown of MCP session manager
+        if mcp_cm:
+            try:
+                await mcp_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            if hasattr(mcp_server, "session_manager") and mcp_server.session_manager:
+                mcp_server.session_manager._has_started = False
+
+        # 4. Graceful shutdown of background webhook workers
+        try:
+            webhook_manager.shutdown(wait=False)
+        except Exception:
+            pass
+
+        # 5. Dispose database engine
+        try:
+            storage_registry.close()
+        except Exception:
+            pass
+
+
+class BoundedBodyLimitMiddleware:
+    """
+    Pure ASGI middleware enforcing MAX_REQUEST_BODY_SIZE.
+    Protects both standard Content-Length requests and streaming/chunked requests
+    without a trustworthy Content-Length header, avoiding unbounded memory buffering.
+    Compatible with FastAPI and mounted MCP Streamable HTTP transport.
+    """
+
+    def __init__(self, app: ASGIApp, default_max_size: int = 1048576) -> None:
+        self.app = app
+        self.default_max_size = default_max_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        try:
+            max_size = int(os.environ.get("MAX_REQUEST_BODY_SIZE", str(self.default_max_size)))
+        except ValueError:
+            max_size = self.default_max_size
+
+        headers = Headers(scope=scope)
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+                if declared_size > max_size:
+                    resp = JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"Request entity too large ({declared_size} bytes exceeds limit of {max_size} bytes)."
+                        },
+                    )
+                    return await resp(scope, receive, send)
+            except ValueError:
+                resp = JSONResponse(status_code=400, content={"detail": "Invalid Content-Length header."})
+                return await resp(scope, receive, send)
+
+        received_body = bytearray()
+        received_request = False
+        body_complete = False
+        trailing_message: Message | None = None
+
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                trailing_message = message
+                break
+
+            received_request = True
+            body = message.get("body", b"")
+            if len(received_body) + len(body) > max_size:
+                resp = JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": f"Request entity too large ({len(received_body) + len(body)} bytes exceeds limit of {max_size} bytes)."
+                    },
+                )
+                return await resp(scope, receive, send)
+
+            received_body.extend(body)
+            if not message.get("more_body", False):
+                body_complete = True
+                break
+
+        cached_messages: deque[Message] = deque()
+        if received_request:
+            cached_messages.append(
+                {"type": "http.request", "body": bytes(received_body), "more_body": not body_complete}
+            )
+        if trailing_message is not None:
+            cached_messages.append(trailing_message)
+
+        async def replay() -> Message:
+            if cached_messages:
+                return cached_messages.popleft()
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
 app = FastAPI(
     title="KintsuTech",
     description="API change detection and resilience monitoring.",
     version="0.1.0",
+    lifespan=lifespan,
 )
+
+# Genuine Model Context Protocol (MCP) Streamable HTTP transport
+app.mount("/mcp", mcp_streamable_app)
+app.mount("/api/v1/mcp/stream", mcp_streamable_app)
 
 ai_adapter = AIAdapter(run_change_workflow)
 
@@ -134,6 +285,8 @@ FRONTEND_ORIGINS = os.environ.get(
 )
 allowed_origins = [origin.strip() for origin in FRONTEND_ORIGINS.split(",") if origin.strip()]
 
+MAX_REQUEST_BODY_SIZE = int(os.environ.get("MAX_REQUEST_BODY_SIZE", "1048576"))  # default 1MB
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
@@ -141,6 +294,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(BoundedBodyLimitMiddleware, default_max_size=MAX_REQUEST_BODY_SIZE)
 
 observer = APIObserver()
 health_monitor = APIHealthMonitor()
@@ -272,37 +426,24 @@ def apply_compatibility_adapter(
     response: dict[str, Any],
     adapter_config: dict[str, Any],
 ) -> dict[str, Any]:
-    """Apply a supported field-copy adapter without mutating the input."""
-    if adapter_config.get("operation") != "copy_field":
+    """Apply a supported compatibility adapter (copy_field or convert_units) without mutating input."""
+    operation = adapter_config.get("operation")
+    if operation not in ("copy_field", "convert_units"):
         raise HTTPException(
             status_code=400,
             detail="Unsupported adapter operation.",
         )
 
-    source_field = adapter_config.get("source_field")
-    target_field = adapter_config.get("target_field")
-
-    if not isinstance(source_field, str) or not source_field:
-        raise HTTPException(status_code=400, detail="Invalid source_field.")
-
-    if not isinstance(target_field, str) or not target_field:
-        raise HTTPException(status_code=400, detail="Invalid target_field.")
-
-    if source_field not in response:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Adapter source field '{source_field}' is missing.",
-        )
-
-    if target_field in response and target_field != source_field:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Adapter target field '{target_field}' already exists.",
-        )
-
-    adapted = dict(response)
-    adapted[target_field] = adapted[source_field]
-    return adapted
+    try:
+        from repair_validator import apply_compatibility_adapter as ai_apply_adapter
+        return ai_apply_adapter(response, adapter_config=adapter_config)
+    except ValueError as exc:
+        msg = str(exc)
+        if "already exists" in msg:
+            raise HTTPException(status_code=409, detail=msg) from exc
+        if "is missing" in msg or "cannot be null" in msg or "must be a finite number" in msg or "below required" in msg or "exceeds required" in msg:
+            raise HTTPException(status_code=422, detail=msg) from exc
+        raise HTTPException(status_code=400, detail=msg) from exc
 
 
 @app.post("/api/v1/compatible/weather")
@@ -487,6 +628,14 @@ def analyze_with_ai(payload: AIAnalyzeRequest):
                 )
                 result["incident_id"] = inc["id"]
 
+                # Dispatch incident.created webhook event
+                event = webhook_manager.create_event(
+                    "incident.created",
+                    inc,
+                    service_id=service_id,
+                )
+                webhook_manager.dispatch_event_background(event)
+
         return result
     except Exception as exc:
         raise HTTPException(
@@ -504,8 +653,15 @@ def list_services():
     return {"services": storage_registry.list_services()}
 
 
-@app.post("/api/v1/services/{service_id}")
-def register_service(service_id: str, payload: ServiceRegisterRequest):
+@app.post(
+    "/api/v1/services/{service_id}",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def register_service(
+    service_id: str,
+    payload: ServiceRegisterRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Register or update a monitored service."""
     try:
         service = storage_registry.register_service(
@@ -541,8 +697,15 @@ def get_service_baseline(service_id: str):
     return {"baseline": baseline}
 
 
-@app.post("/api/v1/services/{service_id}/baseline")
-def save_service_baseline(service_id: str, payload: BaselineSaveRequest):
+@app.post(
+    "/api/v1/services/{service_id}/baseline",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def save_service_baseline(
+    service_id: str,
+    payload: BaselineSaveRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Save a new versioned baseline for a service."""
     try:
         record = storage_registry.save_baseline(
@@ -599,15 +762,52 @@ def get_incident_by_id(incident_id: str):
 # Repair Validation, Guarded Activation & Rollback
 
 
-@app.post("/api/v1/repairs/validate")
+@app.post(
+    "/api/v1/repairs/validate",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def validate_repair_proposal(payload: RepairValidationRequest):
     """
-    Deterministically validate a proposed compatibility adapter using test cases.
+    Deterministically validate a proposed compatibility adapter using test cases
+    and downstream consumer contracts.
     Does NOT activate the repair.
     """
     try:
-        validation_result = validate_repair(payload.adapter, payload.test_cases)
-        storage_registry.record_validation(payload.incident_id, validation_result)
+        service_id = payload.service_id
+        if not service_id:
+            inc = storage_registry.get_incident(payload.incident_id)
+            if inc:
+                service_id = inc.get("service_id")
+
+        validation_result = validate_repair(
+            payload.adapter,
+            payload.test_cases,
+            consumer_contracts=payload.consumer_contracts,
+            service_id=service_id,
+            required_consumers=payload.required_consumers,
+        )
+        storage_registry.record_validation(
+            payload.incident_id,
+            validation_result,
+            adapter_config=payload.adapter,
+            contract_version=validation_result.get("contract_version"),
+        )
+
+        # Dispatch repair.validated webhook event upon successful validation
+        if validation_result.get("eligible_for_activation") or validation_result.get("passed"):
+            effective_service_id = service_id or "kintsutech"
+            event = webhook_manager.create_event(
+                "repair.validated",
+                {
+                    "incident_id": payload.incident_id,
+                    "validation": validation_result,
+                    "adapter": payload.adapter,
+                    "contract_version": validation_result.get("contract_version"),
+                },
+                service_id=effective_service_id,
+            )
+            webhook_manager.dispatch_event_background(event)
+
         return {
             "incident_id": payload.incident_id,
             "validation": validation_result,
@@ -778,31 +978,43 @@ def logout_endpoint(
 
 
 
-@app.post("/api/v1/repairs/activate")
+@app.post(
+    "/api/v1/repairs/activate",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def activate_repair(
     payload: RepairActivationRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    auth_user: str = Depends(verify_api_key),
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
     """
     Guarded repair activation.
-    Rejected if caller is unauthenticated or the proposal has not passed independent validation.
+    Rejected if proposal has not passed independent validation, adapter hash mismatch,
+    or contract version mismatch.
     """
     try:
-        authorizer = payload.authorizer or current_user.display_name or current_user.email or current_user.id
+        authorizer = (
+            payload.authorizer
+            or (current_user.display_name if current_user else None)
+            or (current_user.email if current_user else None)
+            or (current_user.id if current_user else None)
+            or auth_user
+        )
         activation = storage_registry.activate_repair(
             payload.incident_id,
             payload.adapter,
             authorizer=authorizer,
             note=payload.note,
+            contract_version=payload.contract_version,
         )
 
-        # Notify subscribers
+        # Notify subscribers asynchronously in background
         event = webhook_manager.create_event(
             "repair.activated",
             activation,
             service_id=activation.get("service_id", "kintsutech"),
         )
-        webhook_manager.dispatch_event(event)
+        webhook_manager.dispatch_event_background(event)
 
         return {
             "status": "activated",
@@ -812,16 +1024,50 @@ def activate_repair(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/v1/repairs/rollback")
+@app.get("/api/v1/contracts")
+def list_consumer_contracts(service_id: str | None = Query(default=None)):
+    """List registered downstream consumer contracts."""
+    if service_id:
+        return {"contracts": contract_registry.get_for_service(service_id)}
+    return {"contracts": contract_registry.list_all()}
+
+
+@app.post(
+    "/api/v1/contracts",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def register_consumer_contract(
+    payload: ConsumerContractRequest,
+    auth_user: str = Depends(verify_api_key),
+):
+    """Register or update a downstream consumer contract."""
+    try:
+        contract = contract_registry.register(payload.model_dump())
+        return {"status": "registered", "contract": contract}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/repairs/rollback",
+    dependencies=[Depends(rate_limit_mutations)],
+)
 def rollback_repair(
     payload: RepairRollbackRequest,
-    current_user: AuthenticatedUser = Depends(get_current_user),
+    auth_user: str = Depends(verify_api_key),
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
 ):
     """
     Deactivate active adapter and restore service to un-adapted baseline state.
     """
     try:
-        authorizer = payload.authorizer or current_user.display_name or current_user.email or current_user.id
+        authorizer = (
+            payload.authorizer
+            or (current_user.display_name if current_user else None)
+            or (current_user.email if current_user else None)
+            or (current_user.id if current_user else None)
+            or auth_user
+        )
         rollback = storage_registry.rollback_repair(
             payload.service_id,
             authorizer=authorizer,
@@ -833,7 +1079,7 @@ def rollback_repair(
             rollback,
             service_id=payload.service_id,
         )
-        webhook_manager.dispatch_event(event)
+        webhook_manager.dispatch_event_background(event)
 
         return {
             "status": "rolled_back",
@@ -853,7 +1099,10 @@ def get_repair_audit_log():
 # Webhooks (Incoming Receiver & Outgoing Subscriptions)
 
 
-@app.post("/api/v1/webhooks/incoming")
+@app.post(
+    "/api/v1/webhooks/incoming",
+    dependencies=[Depends(rate_limit_webhooks)],
+)
 async def receive_incoming_webhook(request: Request):
     """
     Receive incoming webhooks with HMAC-SHA256 signature verification,
@@ -896,8 +1145,14 @@ async def receive_incoming_webhook(request: Request):
     }
 
 
-@app.post("/api/v1/webhooks/subscriptions")
-def create_webhook_subscription(payload: WebhookSubscriptionRequest):
+@app.post(
+    "/api/v1/webhooks/subscriptions",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def create_webhook_subscription(
+    payload: WebhookSubscriptionRequest,
+    auth_user: str = Depends(verify_api_key),
+):
     """Register an outgoing webhook destination."""
     try:
         subscription = webhook_manager.subscribe(
@@ -906,15 +1161,33 @@ def create_webhook_subscription(payload: WebhookSubscriptionRequest):
             secret=payload.secret,
             description=payload.description,
         )
-        return {"status": "subscribed", "subscription": subscription}
+        # Ensure secret is never returned in response
+        sanitized_sub = dict(subscription)
+        sanitized_sub.pop("secret", None)
+        sanitized_sub["secret_configured"] = bool(subscription.get("secret_configured") or payload.secret)
+        return {"status": "subscribed", "subscription": sanitized_sub}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/v1/webhooks/subscriptions")
-def list_webhook_subscriptions():
-    """List active outgoing webhook subscriptions."""
+def list_webhook_subscriptions(
+    auth_user: str = Depends(verify_api_key),
+):
+    """List active outgoing webhook subscriptions with secrets redacted."""
     return {"subscriptions": webhook_manager.list_subscriptions()}
+
+
+@app.get("/api/v1/webhooks/subscriptions/{subscription_id}")
+def get_webhook_subscription(
+    subscription_id: str,
+    auth_user: str = Depends(verify_api_key),
+):
+    """Get a specific webhook subscription with secret redacted."""
+    sub = storage_registry.get_webhook_subscription(subscription_id, include_secret=False)
+    if not sub:
+        raise HTTPException(status_code=404, detail=f"Subscription '{subscription_id}' not found.")
+    return {"subscription": sub}
 
 
 @app.get("/api/v1/webhooks/deliveries")
@@ -932,10 +1205,27 @@ def get_mcp_tools():
     return {"tools": list_mcp_tools()}
 
 
-@app.post("/api/v1/mcp/tools/call")
-def execute_mcp_tool(payload: MCPToolCallRequest):
+@app.post(
+    "/api/v1/mcp/tools/call",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def execute_mcp_tool(
+    payload: MCPToolCallRequest,
+    request: Request,
+    auth_user: str = Depends(verify_api_key),
+):
     """Execute an MCP tool request against the backend services."""
-    result = call_mcp_tool(payload.name, payload.arguments)
+    args = dict(payload.arguments) if payload.arguments else {}
+    if "api_key" not in args:
+        header_key = request.headers.get("X-API-Key")
+        if not header_key:
+            auth_hdr = request.headers.get("Authorization", "")
+            if auth_hdr.startswith("Bearer "):
+                header_key = auth_hdr[7:].strip()
+        if header_key:
+            args["api_key"] = header_key
+
+    result = call_mcp_tool(payload.name, args)
     if "error" in result and result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return {"tool": payload.name, "result": result}
