@@ -10,7 +10,12 @@ from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+from dotenv import load_dotenv
+
 from app.security import get_configured_api_key, is_auth_enforced, is_production
+
+# Load local environment variables from .env if present
+load_dotenv()
 
 logger = logging.getLogger("kintsutech.auth")
 
