@@ -196,6 +196,78 @@ class AgentEngine:
         caller_is_admin: bool = False,
         caller_id: str = "anonymous",
     ) -> AgentChatResponse:
+        """Run diagnostics first, then optionally explain results using local Ollama."""
+        result = self._process_query_deterministic(
+            query=query,
+            caller_is_admin=caller_is_admin,
+            caller_id=caller_id,
+        )
+
+        if os.environ.get("KINTSUTECH_AGENT_LLM_ENABLED", "false").lower() not in ("true", "1", "yes"):
+            return result
+
+        ollama_url = os.environ.get(
+            "KINTSUTECH_OLLAMA_URL", "http://127.0.0.1:11434"
+        ).rstrip("/")
+        ollama_model = os.environ.get("KINTSUTECH_OLLAMA_MODEL", "qwen2.5:3b")
+
+        try:
+            timeout_seconds = float(os.environ.get("AGENT_LLM_TIMEOUT_SECONDS", "15"))
+            response = httpx.post(
+                f"{ollama_url}/api/chat",
+                json={
+                    "model": ollama_model,
+                    "stream": False,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are KintsuTech, an API resilience assistant. "
+                                "Explain the diagnostic result clearly and concisely. "
+                                "Use only facts in the supplied evidence. Never invent incidents, "
+                                "metrics, consumers, validation results, or actions. If evidence is "
+                                "missing, say so. Never claim a repair is validated or activated "
+                                "unless the evidence explicitly confirms it. Never bypass authorization."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "question": query,
+                                    "diagnostic_response": result.response,
+                                    "verified_evidence": result.evidence,
+                                    "tools_used": result.tools_used,
+                                },
+                                ensure_ascii=False,
+                                default=str,
+                            ),
+                        },
+                    ],
+                },
+                timeout=timeout_seconds,
+            )
+            response.raise_for_status()
+            content = response.json().get("message", {}).get("content", "").strip()
+
+            if not content:
+                return result
+
+            return result.model_copy(
+                update={"response": content, "source": "llm_grounded"}
+            )
+        except Exception:
+            logger.warning(
+                "Local Ollama failed; using deterministic response.", exc_info=True
+            )
+            return result
+
+    def _process_query_deterministic(
+        self,
+        query: str,
+        caller_is_admin: bool = False,
+        caller_id: str = "anonymous",
+    ) -> AgentChatResponse:
         q = query.strip().lower()
         tools_used: list[str] = []
         evidence: dict[str, Any] = {}

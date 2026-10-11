@@ -11,10 +11,10 @@ import uuid
 import jwt
 from dotenv import load_dotenv
 
-load_dotenv(".env")
+load_dotenv()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "6a433392-787c-4fde-8af0-8d2de6414ebb")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "")
 
 
 def generate_token(
@@ -25,6 +25,11 @@ def generate_token(
     can_repair: bool = False,
     days_valid: int = 7,
 ) -> str:
+    if not SUPABASE_JWT_SECRET:
+        raise ValueError(
+            "SUPABASE_JWT_SECRET is not configured in .env or environment variables. "
+            "Please configure SUPABASE_JWT_SECRET in your .env file."
+        )
     now = datetime.datetime.now(datetime.timezone.utc)
     uid = user_id or str(uuid.uuid4())
     payload = {
