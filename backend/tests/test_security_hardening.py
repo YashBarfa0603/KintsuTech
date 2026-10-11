@@ -1,4 +1,5 @@
 import json
+import secrets
 import socket
 from unittest.mock import patch
 from fastapi.testclient import TestClient
@@ -22,7 +23,7 @@ client = TestClient(app)
 
 def test_api_key_missing_and_invalid_rejected(monkeypatch):
     """Ensure missing and invalid API keys return HTTP 401 on protected endpoints."""
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "super-secret-api-key-5a")
+    monkeypatch.setenv("KINTSUTECH_API_KEY", f"mock-api-key-{secrets.token_hex(16)}")
 
     # Missing API key header on repair activation
     resp = client.post(
@@ -108,7 +109,7 @@ def test_production_fails_safely_when_auth_unconfigured(monkeypatch):
 
 def test_authorized_activation_and_rollback(monkeypatch):
     """Verify that requests with valid API key are successfully authorized."""
-    key = "valid-phase5a-test-key"
+    key = f"mock-api-key-{secrets.token_hex(16)}"
     monkeypatch.setenv("KINTSUTECH_API_KEY", key)
 
     # Setup incident and validated adapter

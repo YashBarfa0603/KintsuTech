@@ -816,9 +816,7 @@ def validate_repair_proposal(payload: RepairValidationRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-# ============================================================================
 # Supabase Authentication Endpoints
-# ============================================================================
 
 
 @app.get("/api/v1/auth/health", response_model=AuthHealthResponse)

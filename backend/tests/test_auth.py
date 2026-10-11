@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import secrets
 from unittest.mock import patch
 import jwt
 import pytest
@@ -12,7 +13,7 @@ from app.auth import (
 )
 from fastapi.security import HTTPAuthorizationCredentials
 
-TEST_SECRET = "super-secret-test-key-32-chars-long!"
+TEST_SECRET = f"mock-jwt-test-key-{secrets.token_hex(16)}"
 
 
 def _generate_test_token(
@@ -92,7 +93,7 @@ def test_tampered_signature_raises_401(monkeypatch):
     monkeypatch.setattr("app.auth.SUPABASE_JWT_SECRET", TEST_SECRET)
     monkeypatch.setattr("app.auth.SUPABASE_URL", "")
 
-    token = _generate_test_token(secret="wrong-secret-key-1234567890123456")
+    token = _generate_test_token(secret=f"wrong-jwt-key-{secrets.token_hex(16)}")
 
     with pytest.raises(HTTPException) as exc_info:
         verify_supabase_token(token)
@@ -270,7 +271,7 @@ def test_auth_verify_endpoint_rejects_invalid_token(monkeypatch):
     from fastapi.testclient import TestClient
     client = TestClient(app)
 
-    invalid_token = _generate_test_token(secret="wrong-secret-signature-key-12345")
+    invalid_token = _generate_test_token(secret=f"wrong-jwt-key-{secrets.token_hex(16)}")
     response = client.post(
         "/api/v1/auth/verify",
         headers={"Authorization": f"Bearer {invalid_token}"},
