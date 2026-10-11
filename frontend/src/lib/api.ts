@@ -3,7 +3,36 @@
  * Provides resilient fallbacks if the local backend server is not running.
  */
 
+import { supabase } from "@/lib/supabase";
+import {
+  Project,
+  ChangeRecord,
+  GraphData,
+  IncidentWorkspaceRecord,
+} from "@/types";
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  try {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (session?.access_token) {
+      headers["Authorization"] = `Bearer ${session.access_token}`;
+    }
+  } catch {
+    // Non-fatal if session unavailable
+  }
+  return headers;
+}
+
+// ----------------------------------------------------
+// Health & System Readiness
+// ----------------------------------------------------
 
 export async function checkBackendHealth(): Promise<{ status: string; detail?: string }> {
   try {
@@ -18,6 +47,21 @@ export async function checkBackendHealth(): Promise<{ status: string; detail?: s
     return { status: "error", detail: `HTTP ${res.status}` };
   } catch (err: unknown) {
     return { status: "offline", detail: err instanceof Error ? err.message : "Backend unreachable" };
+  }
+}
+
+export async function checkReadiness(): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/health/readiness`, {
+      method: "GET",
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
@@ -36,6 +80,10 @@ export async function checkAuthHealth(): Promise<Record<string, unknown> | null>
     return null;
   }
 }
+
+// ----------------------------------------------------
+// Authentication & User Sync
+// ----------------------------------------------------
 
 export async function verifyTokenWithBackend(token: string): Promise<Record<string, unknown> | null> {
   try {
@@ -56,6 +104,56 @@ export async function verifyTokenWithBackend(token: string): Promise<Record<stri
   }
 }
 
+export async function fetchCurrentUserProfile(): Promise<{
+  id: string;
+  email: string;
+  role: string;
+  display_name: string;
+  user_metadata?: Record<string, unknown>;
+} | null> {
+  try {
+    const headers = await getAuthHeaders();
+    if (!headers.Authorization) return null;
+
+    const res = await fetch(`${API_BASE_URL}/api/v1/auth/me`, {
+      headers,
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function syncUserProfile(payload: {
+  full_name?: string;
+  email?: string;
+  metadata?: Record<string, unknown>;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/auth/sync`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------
+// Services & Baselines
+// ----------------------------------------------------
+
 export async function fetchBackendServices(): Promise<Record<string, unknown>[]> {
   try {
     const res = await fetch(`${API_BASE_URL}/api/v1/services`, {
@@ -71,9 +169,93 @@ export async function fetchBackendServices(): Promise<Record<string, unknown>[]>
   }
 }
 
-export async function fetchBackendIncidents(): Promise<Record<string, unknown>[]> {
+export async function fetchServiceDetails(serviceId: string): Promise<Record<string, unknown> | null> {
   try {
-    const res = await fetch(`${API_BASE_URL}/api/v1/incidents`, {
+    const res = await fetch(`${API_BASE_URL}/api/v1/services/${serviceId}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.service || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchServiceBaseline(serviceId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/services/${serviceId}/baseline`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.baseline || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function saveServiceBaseline(
+  serviceId: string,
+  payload: { data: Record<string, unknown>; description?: string }
+): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/services/${serviceId}/baseline`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function registerService(
+  serviceId: string,
+  payload: { name: string; base_url?: string; description?: string; is_critical?: boolean }
+): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/services/${serviceId}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------
+// Incidents & AI Drift Analysis
+// ----------------------------------------------------
+
+export async function fetchBackendIncidents(
+  serviceId?: string,
+  status?: string
+): Promise<Record<string, unknown>[]> {
+  try {
+    const params = new URLSearchParams();
+    if (serviceId) params.append("service_id", serviceId);
+    if (status) params.append("status", status);
+
+    const qs = params.toString() ? `?${params.toString()}` : "";
+    const res = await fetch(`${API_BASE_URL}/api/v1/incidents${qs}`, {
       signal: AbortSignal.timeout(3000),
     });
     if (res.ok) {
@@ -85,6 +267,296 @@ export async function fetchBackendIncidents(): Promise<Record<string, unknown>[]
     return [];
   }
 }
+
+export async function fetchIncidentById(incidentId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/incidents/${incidentId}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.incident || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function runAIChangeAnalysis(payload: {
+  baseline: Record<string, unknown>;
+  current: Record<string, unknown>;
+  service_id?: string;
+  include_impact?: boolean;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/ai/analyze`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------
+// Dependency Graph & Blast Radius
+// ----------------------------------------------------
+
+export async function fetchDependencyGraphTopology(): Promise<GraphData | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/dependencies/graph`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const rawGraph = data.dependency_graph;
+      if (rawGraph && Array.isArray(rawGraph.nodes) && Array.isArray(rawGraph.edges)) {
+        return {
+          nodes: rawGraph.nodes,
+          edges: rawGraph.edges,
+        };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchServiceImpact(serviceId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/services/${serviceId}/dependencies`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.impact || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------
+// Repair Validation, Activation & Rollback
+// ----------------------------------------------------
+
+export async function validateRepairProposal(payload: {
+  incident_id: string;
+  adapter: Record<string, unknown>;
+  test_cases: Record<string, unknown>[];
+  consumer_contracts?: Record<string, unknown>[];
+  service_id?: string;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/repairs/validate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function activateRepair(payload: {
+  incident_id: string;
+  adapter: Record<string, unknown>;
+  authorizer?: string;
+  note?: string;
+  contract_version?: string;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/repairs/activate`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function rollbackRepair(payload: {
+  service_id: string;
+  authorizer?: string;
+  reason?: string;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/repairs/rollback`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchRepairAuditLog(): Promise<Record<string, unknown>[]> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/repairs/audit`, {
+      headers,
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data.audit_log) ? data.audit_log : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+// ----------------------------------------------------
+// Consumer Contracts
+// ----------------------------------------------------
+
+export async function fetchConsumerContracts(serviceId?: string): Promise<Record<string, unknown>[]> {
+  try {
+    const qs = serviceId ? `?service_id=${serviceId}` : "";
+    const res = await fetch(`${API_BASE_URL}/api/v1/contracts${qs}`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data.contracts) ? data.contracts : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+// ----------------------------------------------------
+// Webhooks & MCP Tools
+// ----------------------------------------------------
+
+export async function fetchWebhookSubscriptions(): Promise<Record<string, unknown>[]> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/webhooks/subscriptions`, {
+      headers,
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data.subscriptions) ? data.subscriptions : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+export async function createWebhookSubscription(payload: {
+  target_url: string;
+  events?: string[];
+  secret?: string;
+  description?: string;
+}): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/webhooks/subscriptions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(4000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchWebhookDeliveries(): Promise<Record<string, unknown>[]> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/webhooks/deliveries`, {
+      headers,
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data.deliveries) ? data.deliveries : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchMCPTools(): Promise<Record<string, unknown>[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/v1/mcp/tools`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return Array.isArray(data.tools) ? data.tools : [];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+export async function executeMCPTool(
+  toolName: string,
+  args: Record<string, unknown>
+): Promise<Record<string, unknown> | null> {
+  try {
+    const headers = await getAuthHeaders();
+    const res = await fetch(`${API_BASE_URL}/api/v1/mcp/tools/call`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ name: toolName, arguments: args }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
+      return await res.json();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------
+// Conversational AI Agent
+// ----------------------------------------------------
 
 export interface AgentChatApiResponse {
   response: string;
@@ -105,6 +577,11 @@ export async function sendAgentChatMessage(
   };
   if (token) {
     headers["Authorization"] = `Bearer ${token}`;
+  } else {
+    const authHeaders = await getAuthHeaders();
+    if (authHeaders.Authorization) {
+      headers["Authorization"] = authHeaders.Authorization;
+    }
   }
 
   try {

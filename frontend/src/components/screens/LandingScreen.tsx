@@ -1,176 +1,373 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import { Button, Badge } from "@/components/ui/Primitives";
 import { Icon, Logo } from "@/components/ui/Icons";
+import { Screen } from "@/types";
+import { WorkflowStepper } from "./landing/WorkflowStepper";
+import { AboutSection } from "./landing/AboutSection";
+import { HowItWorks } from "./landing/HowItWorks";
+import { InteractiveDemo } from "./landing/InteractiveDemo";
+import "./landing/landing.css";
 
-export function LandingScreen({ onEnter }: { onEnter: () => void }) {
+interface LandingScreenProps {
+  onEnter: (screen?: Screen) => void;
+  onOpenAuth?: (mode: "signin" | "signup") => void;
+  isAuthenticated?: boolean;
+}
+
+export function LandingScreen({ onEnter, onOpenAuth, isAuthenticated = false }: LandingScreenProps) {
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const mobileMenuRef = useRef<HTMLDivElement>(null);
+
+  // Scroll-driven horizontal recovery workflow state
+  const heroRef = useRef<HTMLElement>(null);
+  const [scrollProgress, setScrollProgress] = useState(0);
   const [heroStage, setHeroStage] = useState(0);
-  const [heroPlaying, setHeroPlaying] = useState(false);
+
+  const scrollTo = (id: string) => {
+    document.getElementById(id)?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const closeMenuAnd = (action: () => void) => {
+    setMobileMenuOpen(false);
+    action();
+  };
+
+  const handleSignIn = () => {
+    if (isAuthenticated) {
+      onEnter("overview");
+    } else if (onOpenAuth) {
+      onOpenAuth("signin");
+    } else {
+      onEnter("overview");
+    }
+  };
+
+  const handleSignUp = () => {
+    if (isAuthenticated) {
+      onEnter("projects");
+    } else if (onOpenAuth) {
+      onOpenAuth("signup");
+    } else {
+      onEnter("projects");
+    }
+  };
+
+  // Scroll listener for hero recovery workflow progress
+  const handleScroll = useCallback(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setHeroStage(3);
+      setScrollProgress(1);
+      return;
+    }
+
+    const heroEl = heroRef.current;
+    const aboutEl = document.getElementById("about");
+    if (!heroEl || !aboutEl) return;
+
+    const aboutRect = aboutEl.getBoundingClientRect();
+    const viewportHeight = window.innerHeight;
+
+    // progress = 0 at top of hero (window.scrollY === 0)
+    // progress = 1 when vertical middle of About section reaches the middle of viewport
+    const aboutMiddle = aboutRect.top + aboutRect.height / 2;
+    const viewportMiddle = viewportHeight / 2;
+
+    const startY = 0;
+    const currentY = window.scrollY;
+    const targetY = currentY + (aboutMiddle - viewportMiddle);
+
+    if (targetY <= startY) {
+      setScrollProgress(1);
+      setHeroStage(3);
+      return;
+    }
+
+    const rawProgress = (currentY - startY) / (targetY - startY);
+    const clampedProgress = Math.min(1, Math.max(0, rawProgress));
+
+    setScrollProgress(clampedProgress);
+
+    // Derive heroStage: 0-0.25 -> 0, 0.25-0.5 -> 1, 0.5-0.75 -> 2, 0.75-1 -> 3
+    let stage = 0;
+    if (clampedProgress >= 0.75) stage = 3;
+    else if (clampedProgress >= 0.5) stage = 2;
+    else if (clampedProgress >= 0.25) stage = 1;
+    else stage = 0;
+
+    setHeroStage(stage);
+  }, []);
 
   useEffect(() => {
-    if (!heroPlaying) return;
-    const timer = window.setTimeout(() => {
-      setHeroStage((s) => {
-        if (s >= 2) {
-          setHeroPlaying(false);
-          return 3;
-        }
-        return s + 1;
-      });
-    }, 900);
-    return () => window.clearTimeout(timer);
-  }, [heroPlaying]);
+    let ticking = false;
+    const onScroll = () => {
+      if (!ticking) {
+        window.requestAnimationFrame(() => {
+          handleScroll();
+          ticking = false;
+        });
+        ticking = true;
+      }
+    };
+
+    window.addEventListener("scroll", onScroll, { passive: true });
+    handleScroll();
+
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [handleScroll]);
+
+  // Mobile menu keyboard & backdrop listeners
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    const close = () => setMobileMenuOpen(false);
+    const onKeyDown = (event: KeyboardEvent) => event.key === "Escape" && close();
+    const onPointerDown = (event: PointerEvent) => {
+      if (
+        !mobileMenuRef.current?.contains(event.target as Node) &&
+        !menuButtonRef.current?.contains(event.target as Node)
+      ) {
+        close();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    document.addEventListener("pointerdown", onPointerDown);
+    window.setTimeout(
+      () => mobileMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus(),
+      0
+    );
+
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("pointerdown", onPointerDown);
+      window.setTimeout(() => menuButtonRef.current?.focus(), 0);
+    };
+  }, [mobileMenuOpen]);
+
+  const watchRecovery = () => {
+    scrollTo("about");
+  };
 
   return (
-    <main className="min-h-screen bg-[#FAF8F5] text-stone-900">
-      {/* Top Nav */}
-      <nav className="border-b border-stone-200 bg-white/80 backdrop-blur sticky top-0 z-30">
-        <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-          <Logo />
-          <div className="flex items-center gap-6 text-sm font-semibold text-stone-600">
-            <a href="#how" className="hover:text-stone-900">How It Works</a>
-            <a href="#how" className="hover:text-stone-900">Architecture</a>
+    <main className="landing editorial-landing">
+      {/* Navigation */}
+      <nav className="landing-nav editorial-nav">
+        <div className="container landing-nav-inner">
+          <Button
+            variant="ghost"
+            className="landing-logo-button"
+            onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+            ariaLabel="KintsuTech home"
+          >
+            <Logo />
+          </Button>
+
+          <div className="landing-links">
+            <Button variant="ghost" onClick={() => scrollTo("product")}>
+              Product
+            </Button>
+            <Button variant="ghost" onClick={() => scrollTo("about")}>
+              About KintsuTech
+            </Button>
+            <Button variant="ghost" onClick={() => scrollTo("how")}>
+              How It Works
+            </Button>
+            <Button variant="ghost" onClick={() => scrollTo("features")}>
+              Features
+            </Button>
           </div>
-          <div className="flex items-center gap-3">
-            <Button variant="secondary" onClick={onEnter}>Sign In</Button>
-            <Button variant="primary" onClick={onEnter}>Explore Workspace</Button>
+
+          <div className="nav-actions">
+            <Button variant="ghost" onClick={handleSignIn}>
+              Sign In
+            </Button>
+            <Button onClick={handleSignUp}>
+              Get Started
+            </Button>
           </div>
+
+          <button
+            ref={menuButtonRef}
+            className="landing-menu-button"
+            onClick={() => setMobileMenuOpen((open) => !open)}
+            aria-label={mobileMenuOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={mobileMenuOpen}
+          >
+            <Icon name={mobileMenuOpen ? "close" : "menu"} />
+          </button>
         </div>
       </nav>
 
-      {/* Hero Section */}
-      <section className="max-w-6xl mx-auto px-6 py-20 grid grid-cols-2 gap-12 items-center">
-        <div>
-          <span className="text-xs font-bold tracking-widest text-amber-700 uppercase">
-            RESILIENCE, BY DESIGN
-          </span>
-          <h1 className="text-5xl font-extrabold tracking-tight text-stone-950 mt-3 mb-6 leading-tight">
-            When APIs break,<br />
-            <em className="text-emerald-800 font-serif italic">connections heal.</em>
-          </h1>
-          <p className="text-base text-stone-600 mb-8 leading-relaxed">
-            Detect external dependency changes, trace their impact across your workflows, and prove
-            deterministic compatibility repairs before activation.
-          </p>
-          <div className="flex items-center gap-4">
-            <Button variant="primary" icon="arrow" onClick={onEnter}>
-              Open KintsuTech Console
+      {/* Mobile Drawer Menu */}
+      {mobileMenuOpen && (
+        <div className="landing-menu-scrim">
+          <div
+            ref={mobileMenuRef}
+            className="landing-mobile-menu"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation"
+          >
+            <Button variant="ghost" onClick={() => closeMenuAnd(() => scrollTo("product"))}>
+              Product
             </Button>
-            <Button
-              variant="secondary"
-              icon="play"
-              onClick={() => {
-                setHeroStage(0);
-                setHeroPlaying(true);
-              }}
-            >
-              Watch simulated recovery
+            <Button variant="ghost" onClick={() => closeMenuAnd(() => scrollTo("about"))}>
+              About KintsuTech
+            </Button>
+            <Button variant="ghost" onClick={() => closeMenuAnd(() => scrollTo("how"))}>
+              How It Works
+            </Button>
+            <Button variant="ghost" onClick={() => closeMenuAnd(() => scrollTo("features"))}>
+              Features
+            </Button>
+            <Button variant="secondary" onClick={() => closeMenuAnd(handleSignIn)}>
+              Sign In
+            </Button>
+            <Button onClick={() => closeMenuAnd(handleSignUp)}>
+              Get Started
             </Button>
           </div>
         </div>
+      )}
 
-        {/* Animated Visual Card */}
-        <div className="p-6 bg-white border border-stone-200 rounded-lg shadow-sm">
-          <div className="flex items-center justify-between pb-4 border-b border-stone-100 mb-6">
-            <span className="text-xs font-bold text-stone-500 uppercase">SIMULATED RECOVERY PATH</span>
-            <Badge tone={heroStage === 3 ? "success" : heroStage === 2 ? "gold" : heroStage === 1 ? "danger" : "neutral"}>
-              {heroStage === 0
-                ? "Connected"
-                : heroStage === 1
-                ? "Change detected"
-                : heroStage === 2
-                ? "Validation running"
-                : "Validated · Reconnected"}
-            </Badge>
+      {/* Hero Section (#product) */}
+      <section id="product" ref={heroRef} className="editorial-hero">
+        <div className="container editorial-hero-grid">
+          <div className="editorial-hero-copy">
+            <span className="eyebrow">RESILIENCE, BY DESIGN</span>
+            <h1>
+              When APIs break,<br />
+              <em>connections heal.</em>
+            </h1>
+            <p>
+              Detect external dependency changes, trace their impact, and prove compatibility repairs before applying them.
+            </p>
+            <div className="hero-actions">
+              <Button onClick={handleSignUp} icon="arrow">
+                Explore KintsuTech
+              </Button>
+              <Button variant="secondary" icon="play" onClick={watchRecovery}>
+                Watch the recovery
+              </Button>
+            </div>
           </div>
 
-          <div className="flex items-center justify-between px-4 py-8 bg-stone-50 rounded border border-stone-100 mb-4">
-            <div className="text-center">
-              <span className="w-10 h-10 rounded bg-blue-100 text-blue-700 flex items-center justify-center mx-auto mb-2">
-                <Icon name="home" size={18} />
-              </span>
-              <strong className="text-xs block text-stone-800">Checkout App</strong>
+          <div
+            className={`connection-illustration stage-${heroStage}`}
+            aria-label="Simulated application and API recovery illustration"
+          >
+            <div className="connection-caption">
+              <span>SIMULATED RECOVERY PATH</span>
+              <Badge
+                tone={
+                  heroStage === 3
+                    ? "success"
+                    : heroStage === 2
+                    ? "gold"
+                    : heroStage === 1
+                    ? "danger"
+                    : "neutral"
+                }
+              >
+                {heroStage === 0
+                  ? "Connected"
+                  : heroStage === 1
+                  ? "Change detected"
+                  : heroStage === 2
+                  ? "Validation running"
+                  : "Validated · reconnected"}
+              </Badge>
             </div>
 
-            <div className="flex-1 px-4 text-center">
-              <div className="h-0.5 bg-stone-300 relative my-2">
-                <span
-                  className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 rounded-full flex items-center justify-center text-[10px] ${
-                    heroStage === 3 ? "bg-emerald-600 text-white" : heroStage >= 1 ? "bg-red-500 text-white" : "bg-stone-500 text-white"
-                  }`}
-                >
-                  {heroStage === 3 ? "✓" : heroStage >= 1 ? "!" : "→"}
+            <div className="connection-scene">
+              <div className="connection-node application">
+                <span>
+                  <Icon name="home" />
                 </span>
+                <small>APPLICATION</small>
+                <strong>Checkout</strong>
+              </div>
+              <div className="connection-path">
+                <span className="path-base" />
+                <span className="path-break" />
+                <span className="path-gold" />
+                <Icon
+                  name={
+                    heroStage === 3 ? "check" : heroStage >= 1 ? "alert" : "arrow"
+                  }
+                />
+              </div>
+              <div className="connection-node api">
+                <span>
+                  <Icon name="api" />
+                </span>
+                <small>EXTERNAL API</small>
+                <strong>Payments</strong>
               </div>
             </div>
 
-            <div className="text-center">
-              <span className="w-10 h-10 rounded bg-amber-100 text-amber-700 flex items-center justify-center mx-auto mb-2">
-                <Icon name="api" size={18} />
+            <div className="connection-evidence">
+              <code>
+                {heroStage < 1
+                  ? '"name": "Annual Plan"'
+                  : '"display_name": "Annual Plan"'}
+              </code>
+              <span>
+                {heroStage === 0
+                  ? "Baseline observed"
+                  : heroStage === 1
+                  ? "Response shape changed"
+                  : heroStage === 2
+                  ? "14 deterministic checks running"
+                  : "Tests passed · awaiting review"}
               </span>
-              <strong className="text-xs block text-stone-800">Payments API</strong>
             </div>
-          </div>
 
-          <div className="p-3 bg-stone-900 text-stone-100 font-mono text-xs rounded">
-            <code>
-              {heroStage < 1 ? '"name": "Annual Pro Plan"' : '"display_name": "Annual Pro Plan"'}
-            </code>
-            <div className="text-stone-400 font-sans text-[11px] mt-1">
-              {heroStage === 0
-                ? "Baseline observed and locked."
-                : heroStage === 1
-                ? "Divergence detected: response field replaced."
-                : heroStage === 2
-                ? "14 isolated sandbox checks executing."
-                : "Deterministic verification passed. Ready for approval."}
+            <div className="hero-scroll-workflow-anchor">
+              <WorkflowStepper progress={scrollProgress} stage={heroStage} />
             </div>
           </div>
         </div>
       </section>
 
-      {/* How it Works */}
-      <section id="how" className="max-w-6xl mx-auto px-6 py-16 border-t border-stone-200">
-        <div className="text-center mb-12">
-          <span className="text-xs font-bold text-amber-700 tracking-wider uppercase">HOW IT WORKS</span>
-          <h2 className="text-3xl font-extrabold text-stone-950 mt-1">Evidence before action.</h2>
-        </div>
-        <div className="grid grid-cols-3 gap-8">
-          <div className="p-6 bg-white border border-stone-200 rounded-md">
-            <span className="text-xs font-bold text-stone-400 block mb-2">01</span>
-            <Icon name="alert" size={24} className="text-amber-600 mb-3" />
-            <h3 className="font-bold text-base text-stone-900 mb-1">Detect</h3>
-            <p className="text-sm text-stone-600">
-              Continuously compare observed API and dependency behavior with verified baselines.
-            </p>
+      {/* About Section (#about) */}
+      <AboutSection />
+
+      {/* How It Works Section (#how) */}
+      <HowItWorks />
+
+      {/* Interactive Demonstration (#features) */}
+      <InteractiveDemo />
+
+      {/* Final CTA & Footer */}
+      <section className="editorial-final">
+        <div className="container">
+          <div className="editorial-final-content">
+            <span className="eyebrow">KINTSUTECH</span>
+            <h2>Make your integrations resilient.</h2>
+            <p>Understand changes before they become failures.</p>
+            <div className="hero-actions hero-actions-single">
+              <Button onClick={handleSignUp} icon="arrow">
+                Get Started
+              </Button>
+            </div>
           </div>
-          <div className="p-6 bg-white border border-stone-200 rounded-md">
-            <span className="text-xs font-bold text-stone-400 block mb-2">02</span>
-            <Icon name="graph" size={24} className="text-blue-600 mb-3" />
-            <h3 className="font-bold text-base text-stone-900 mb-1">Trace & Repair</h3>
-            <p className="text-sm text-stone-600">
-              Trace confirmed impact paths through the AI Dependency Graph and prepare an isolated proposal.
-            </p>
-          </div>
-          <div className="p-6 bg-white border border-stone-200 rounded-md">
-            <span className="text-xs font-bold text-stone-400 block mb-2">03</span>
-            <Icon name="test" size={24} className="text-emerald-600 mb-3" />
-            <h3 className="font-bold text-base text-stone-900 mb-1">Validate</h3>
-            <p className="text-sm text-stone-600">
-              Run independent deterministic checks in a sandbox before requiring human engineering review.
-            </p>
-          </div>
+
+          <footer>
+            <Logo />
+            <span>© 2026 KintsuTech · Demonstration application</span>
+            <Button variant="ghost" onClick={() => onEnter("settings")}>
+              Platform Settings
+            </Button>
+          </footer>
         </div>
       </section>
-
-      {/* Footer */}
-      <footer className="border-t border-stone-200 py-10 bg-white">
-        <div className="max-w-6xl mx-auto px-6 flex items-center justify-between text-xs text-stone-500">
-          <Logo />
-          <div>© {new Date().getFullYear()} KintsuTech. Detect. Adapt. Recover.</div>
-        </div>
-      </footer>
     </main>
   );
 }

@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { Screen } from "@/types";
 import { Button, Badge } from "@/components/ui/Primitives";
 import { Icon } from "@/components/ui/Icons";
+import { checkBackendHealth } from "@/lib/api";
 
 export function IntegrationsScreen({
   navigate,
@@ -32,6 +33,20 @@ export function IntegrationsScreen({
   const [repo, setRepo] = useState("kintsu/pulse-api");
   const [branch, setBranch] = useState("main");
   const [toast, setToast] = useState("");
+
+  React.useEffect(() => {
+    checkBackendHealth().then((health) => {
+      if (health.status === "ok") {
+        setStates((prev) => ({
+          ...prev,
+          ci: "Connected (FastAPI Sandbox)",
+          observability: "Active (Telemetry Monitor)",
+          mcpCapability: "Connected (MCP Streamable)",
+          webhookReceiver: "Active (HMAC-SHA256)",
+        }));
+      }
+    });
+  }, []);
 
   const parseSpec = (text: string) => {
     setImportError("");
