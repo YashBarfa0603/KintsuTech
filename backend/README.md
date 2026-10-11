@@ -471,3 +471,152 @@ docker run -d \
   3. **Canonical SHA-256 Adapter Hash Verification**: Activation computes the canonical SHA-256 hash of the incoming adapter configuration and verifies that it exactly matches the independently validated adapter, blocking post-validation parameter tampering.
   4. **Consumer Contract Version Matching**: Ensures the adapter adheres to the consumer contract version verified during validation.
 - Tool responses and error payloads never leak internal environment variables, API keys, or webhook signing secrets.
+
+---
+
+## Alert Lifecycle & Voice Agent Pipeline
+
+### Architecture & Component Responsibilities
+
+```
+                                +-----------------------------+
+                                |  Timeline / Incident Event |
+                                +--------------+--------------+
+                                               |
+                                               v
+                                +-----------------------------+
+                                |      AlertService           |
+                                |  - Evaluates severity       |
+                                |  - Checks quiet hours & tz  |
+                                |  - Enforces idempotency key |
+                                +--------------+--------------+
+                                               |
+                                               v
++------------------------+      +-----------------------------+      +------------------------+
+|   Background Worker    | <--> |   Persistent Storage        | <--> |  Authenticated APIs    |
+|   (AlertScheduler)     |      |   (AlertModel, Deliveries,  |      |  - List / Filter       |
+|  - Distributed locks   |      |    AlertPreferences)        |      |  - Acknowledge/Resolve |
+|  - Bounded retries     |      +-----------------------------+      |  - User preferences    |
+|  - Auto-escalation     |                     ^                     +------------------------+
++------------------------+                     |
+                                               v
+                                +-----------------------------+
+                                |      Voice Agent Pipeline   |
+                                |  - MLX Whisper STT (local)  |
+                                |  - Ollama / Fallback Engine |
+                                |  - PCM WAV TTS Synthesizer  |
+                                |  - Audited Voice Ack        |
+                                +-----------------------------+
+```
+
+1. **`app.storage.StorageRegistry`**:
+   - Manages tables: `alerts`, `alert_deliveries`, `alert_preferences`.
+   - Idempotency via composite constraint `(idempotency_key, user_id)`.
+   - Strict status transition state machine: `pending` -> `delivering` -> `delivered` -> `acknowledged` / `escalated` / `resolved` / `failed` / `cancelled`.
+   - Concurrency locking with `locked_until` leases.
+2. **`app.alerts.AlertService`**:
+   - Evaluates incident and timeline events. High/critical incidents trigger immediate alerts; breaking schema changes trigger alerts; low-severity events respect user `min_severity`.
+   - Evaluates quiet hours based on user's timezone (`ZoneInfo`).
+   - Dispatches initial delivery through configured channels (`in_app`, `voice`). Telephony is disabled by default.
+3. **`app.scheduler.AlertScheduler`**:
+   - Background async worker polling for due/overdue alerts.
+   - Claims atomic leases (`claim_due_alerts`) so concurrent workers do not double-process alerts.
+   - Retries failed attempts with bounded exponential backoff up to `max_attempts`.
+   - Escalates unacknowledged alerts when deadlines expire.
+4. **`app.voice.VoiceAgent`**:
+   - **STT**: Validates audio uploads (format, max 15MB, silence/corruption checks) and uses local Apple Silicon `mlx_whisper`.
+   - **Reasoning**: Resolves intent against user's authorized alerts. Clarifies ambiguous requests ("You have multiple alerts, which one?"). Consequential state changes (acknowledgment) require strictly validated matches.
+   - **TTS**: Synthesizes response audio via Piper voice model or standard RFC-compliant WAV audio stream.
+   - **Telephony Safety**: PSTN calls remain strictly disabled (`telephony_enabled=False`).
+
+### Database Schema & Safe Migration Strategy
+
+- **`alerts` table**:
+  - `id`: Unique identifier (`alt_...`).
+  - `user_id`: Target recipient Supabase user UUID.
+  - `incident_id`: Associated incident ID (`INC-...`), if applicable.
+  - `source_event_id`: Source webhook/timeline event ID.
+  - `idempotency_key`: Deduplication key.
+  - `title`, `message`: Alert details.
+  - `severity`: `"critical"`, `"high"`, `"medium"`, `"low"`, `"info"`.
+  - `status`: Valid status state machine.
+  - `created_at`, `updated_at`, `due_at`, `acknowledged_at`, `resolved_at`.
+  - `escalation_level`, `next_escalation_at`, `attempt_count`, `last_attempt_at`.
+  - `delivery_channel`, `locked_until`, `metadata_json`.
+- **`alert_deliveries` table**: Complete audit log of every delivery attempt, channel, status, and escalation step.
+- **`alert_preferences` table**: Configurable per-user channels, quiet hours, timezone, voice toggles, retry limits, and telephony consent.
+- **Migration Strategy**: Handled automatically in `StorageRegistry._migrate_schema()`. Recreates tables safely without dropping data, alters missing columns, and ensures zero downtime during schema upgrades.
+
+### API Endpoints
+
+All alert operations require Bearer token authentication via Supabase JWT (`Authorization: Bearer <token>`):
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/alerts` | Create a persistent alert (idempotent via `idempotency_key`) |
+| `GET` | `/api/v1/alerts` | List current user's alerts (supports `status`, `severity`, `incident_id` filters) |
+| `GET` | `/api/v1/alerts/{alert_id}` | Retrieve alert details (scoped to owner; 404 if unauthorized) |
+| `POST` | `/api/v1/alerts/{alert_id}/acknowledge` | Acknowledge alert (idempotent, stops escalation) |
+| `POST` | `/api/v1/alerts/{alert_id}/resolve` | Resolve alert (marks terminal status) |
+| `GET` | `/api/v1/alerts/{alert_id}/history` | Retrieve full delivery and escalation audit trail |
+| `GET` | `/api/v1/alert-preferences` | Read user's alert channels, quiet hours, and timeouts |
+| `PUT` | `/api/v1/alert-preferences` | Update user alert preferences |
+| `POST` | `/api/v1/voice/transcribe` | Upload audio and transcribe via local MLX Whisper |
+| `POST` | `/api/v1/voice/respond` | Natural language voice turn (detects ack/inquiry with audit) |
+| `POST` | `/api/v1/voice/synthesize` | Synthesize text to playable `audio/wav` |
+| `GET` | `/api/v1/voice/status` | Read component readiness (STT, Ollama LLM, TTS, Telephony) |
+
+### Setup & Local Commands (macOS)
+
+#### 1. Start the Backend & Scheduler
+```bash
+cd backend
+uv run uvicorn app.main:app --reload --port 8000
+```
+
+#### 2. Run All Automated Tests
+```bash
+cd backend
+# Run all tests (baseline 255 + 41 new alert/voice tests = 296 passing)
+uv run pytest -v
+
+# Run alert lifecycle tests only
+uv run pytest tests/test_alerts.py -v
+
+# Run voice agent tests only
+uv run pytest tests/test_voice_agent.py -v
+```
+
+#### 3. Optional Local Ollama Setup
+```bash
+# Install Ollama on macOS
+brew install ollama
+
+# Pull recommended model
+ollama pull qwen2.5:3b
+
+# Start daemon
+ollama serve
+
+# Enable in backend/.env:
+# KINTSUTECH_AGENT_LLM_ENABLED=true
+# KINTSUTECH_OLLAMA_URL=http://127.0.0.1:11434
+# KINTSUTECH_OLLAMA_MODEL=qwen2.5:3b
+```
+
+#### 4. Optional Local Piper TTS Setup
+```bash
+# Download Piper voice model and set in backend/.env:
+# KINTSUTECH_VOICE_TTS_ENABLED=true
+# KINTSUTECH_TTS_MODEL_PATH=/path/to/en_US-lessac-medium.onnx
+```
+
+### Telephony & Safety Requirements for Real Phone Calls
+
+Outbound PSTN telephone calls are **strictly disabled** (`KINTSUTECH_TELEPHONY_ENABLED=false`).
+To enable real phone calls in a production deployment, the following are required:
+1. **PSTN Gateway Integration**: An enterprise telephony provider (Twilio Voice API, Amazon Connect, or SIP Trunking) with verified outbound Caller ID numbers.
+2. **Explicit User Consent**: User must actively opt in and verify phone ownership via SMS/voice OTP challenge.
+3. **Opt-Out Compliance**: Mandatory adherence to TCPA/telecom regulations including immediate opt-out support.
+4. **Quiet Hours Enforcement**: Prohibit automated phone calls during legal quiet hours (9:00 PM to 8:00 AM recipient local time) unless explicitly classified as a verified life-safety emergency.
+5. **Call Rate & Cost Limits**: Enforce bounded retries (maximum 2 calls per incident) to prevent cascading toll fraud or call storms.

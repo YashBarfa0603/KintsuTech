@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env
 load_dotenv()
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, UploadFile, File, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -92,6 +92,16 @@ from app.provider_client import (
 from app.storage import storage_registry
 from app.webhooks import webhook_manager
 from app.agent import AgentChatRequest, AgentChatResponse, AgentEngine
+from app.alerts import alert_service
+from app.scheduler import alert_scheduler
+from app.voice import (
+    AudioValidationError,
+    validate_audio_file,
+    voice_engine,
+    voice_stt,
+    voice_tts,
+)
+
 
 
 # Request models
@@ -177,9 +187,18 @@ async def lifespan(app: FastAPI):
         mcp_cm = mcp_server.session_manager.run()
         await mcp_cm.__aenter__()
 
+    # 3. Start alert escalation background scheduler
+    alert_scheduler.start()
+
     try:
         yield
     finally:
+        # Graceful shutdown of alert scheduler
+        try:
+            alert_scheduler.stop()
+        except Exception:
+            pass
+
         # 3. Graceful shutdown of MCP session manager
         if mcp_cm:
             try:
@@ -657,6 +676,10 @@ def analyze_with_ai(payload: AIAnalyzeRequest):
                     service_id=service_id,
                 )
                 webhook_manager.dispatch_event_background(event)
+
+                # Automatically create alerts from important timeline changes
+                alert_service.handle_incident_event(inc)
+
 
         return result
     except Exception as exc:
@@ -1430,4 +1453,322 @@ def chat_with_agent(
         caller_is_admin=is_admin,
         caller_id=user_id,
     )
+
+
+# ============================================================================
+# Alert Lifecycle & Preference Endpoints
+# ============================================================================
+
+class CreateAlertRequest(BaseModel):
+    title: str
+    message: str
+    severity: str = "medium"
+    incident_id: str | None = None
+    source_event_id: str | None = None
+    idempotency_key: str | None = None
+    delivery_channel: str = "in_app"
+    metadata: dict[str, Any] | None = None
+
+
+class AcknowledgeAlertRequest(BaseModel):
+    note: str | None = None
+
+
+class ResolveAlertRequest(BaseModel):
+    note: str | None = None
+
+
+class AlertPreferenceUpdateRequest(BaseModel):
+    channels: list[str] | None = None
+    min_severity: str | None = None
+    quiet_hours_enabled: bool | None = None
+    quiet_hours_start: str | None = None
+    quiet_hours_end: str | None = None
+    timezone: str | None = None
+    voice_enabled: bool | None = None
+    max_attempts: int | None = None
+    escalation_interval_seconds: int | None = None
+    ack_timeout_seconds: int | None = None
+    phone_consent: bool | None = None
+    phone_number: str | None = None
+
+
+@app.post(
+    "/api/v1/alerts",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def create_alert_endpoint(
+    payload: CreateAlertRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Create a persistent alert for the authenticated user."""
+    try:
+        alert = storage_registry.create_alert(
+            user_id=current_user.id,
+            title=payload.title,
+            message=payload.message,
+            severity=payload.severity,
+            incident_id=payload.incident_id,
+            source_event_id=payload.source_event_id,
+            idempotency_key=payload.idempotency_key,
+            delivery_channel=payload.delivery_channel,
+            metadata=payload.metadata,
+        )
+        alert_service.deliver_alert(alert, channel=payload.delivery_channel)
+        return alert
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/alerts")
+def list_alerts_endpoint(
+    status: str | None = Query(default=None),
+    severity: str | None = Query(default=None),
+    incident_id: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """List alerts scoped strictly to the authenticated user."""
+    return storage_registry.list_alerts(
+        user_id=current_user.id,
+        status=status,
+        severity=severity,
+        incident_id=incident_id,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/api/v1/alerts/{alert_id}")
+def get_alert_endpoint(
+    alert_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Retrieve an alert by ID, verifying user ownership."""
+    alert = storage_registry.get_alert(alert_id, user_id=current_user.id)
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    return alert
+
+
+@app.post(
+    "/api/v1/alerts/{alert_id}/acknowledge",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def acknowledge_alert_endpoint(
+    alert_id: str,
+    payload: AcknowledgeAlertRequest | None = None,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Acknowledge an alert, verifying user ownership and idempotency."""
+    note = payload.note if payload else None
+    try:
+        return storage_registry.acknowledge_alert(
+            alert_id=alert_id,
+            user_id=current_user.id,
+            note=note,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "not found" in detail.lower() or "access denied" in detail.lower():
+            raise HTTPException(status_code=404, detail="Alert not found") from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@app.post(
+    "/api/v1/alerts/{alert_id}/resolve",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def resolve_alert_endpoint(
+    alert_id: str,
+    payload: ResolveAlertRequest | None = None,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Resolve an alert, verifying user ownership."""
+    note = payload.note if payload else None
+    try:
+        return storage_registry.resolve_alert(
+            alert_id=alert_id,
+            user_id=current_user.id,
+            note=note,
+        )
+    except ValueError as exc:
+        detail = str(exc)
+        if "not found" in detail.lower() or "access denied" in detail.lower():
+            raise HTTPException(status_code=404, detail="Alert not found") from exc
+        raise HTTPException(status_code=400, detail=detail) from exc
+
+
+@app.get("/api/v1/alerts/{alert_id}/history")
+def get_alert_history_endpoint(
+    alert_id: str,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """View delivery attempts and escalation history for an alert."""
+    try:
+        return storage_registry.get_alert_history(alert_id=alert_id, user_id=current_user.id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Alert not found") from exc
+
+
+@app.get("/api/v1/alert-preferences")
+def get_alert_preferences_endpoint(
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Read alert preferences for the authenticated user."""
+    return storage_registry.get_alert_preferences(user_id=current_user.id)
+
+
+@app.put(
+    "/api/v1/alert-preferences",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def update_alert_preferences_endpoint(
+    payload: AlertPreferenceUpdateRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Update alert preferences for the authenticated user."""
+    data = payload.model_dump(exclude_unset=True)
+    return storage_registry.update_alert_preferences(user_id=current_user.id, preferences=data)
+
+
+# ============================================================================
+# Voice Agent Endpoints
+# ============================================================================
+
+class VoiceRespondRequest(BaseModel):
+    transcript: str
+    synthesize_audio: bool = False
+
+
+class VoiceSynthesizeRequest(BaseModel):
+    text: str
+
+
+@app.post(
+    "/api/v1/voice/transcribe",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+async def voice_transcribe_endpoint(
+    file: UploadFile = File(...),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Transcribe an uploaded audio recording using local MLX Whisper."""
+    del current_user
+    try:
+        content = await file.read()
+        suffix = validate_audio_file(content, filename=file.filename, content_type=file.content_type)
+    except AudioValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, prefix="kintsu-voice-", delete=False) as tf:
+            temp_path = tf.name
+            tf.write(content)
+
+        if not voice_stt.is_available():
+            raise HTTPException(
+                status_code=503,
+                detail="Local Speech-To-Text (MLX Whisper) is unavailable or disabled.",
+            )
+
+        transcript = await asyncio.to_thread(voice_stt.transcribe, temp_path)
+        return {
+            "transcript": transcript,
+            "engine": "mlx-whisper",
+            "local_processing": True,
+        }
+    finally:
+        await file.close()
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+@app.post(
+    "/api/v1/voice/respond",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def voice_respond_endpoint(
+    payload: VoiceRespondRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """
+    Process voice query/acknowledgment with deterministic safety and optional audio synthesis.
+    """
+    result = voice_engine.process_voice_turn(
+        transcript=payload.transcript,
+        user_id=current_user.id,
+        synthesize_audio=payload.synthesize_audio,
+    )
+    audio_base64 = None
+    if result.get("audio_bytes"):
+        import base64
+        audio_base64 = base64.b64encode(result["audio_bytes"]).decode("ascii")
+
+    return {
+        "transcript": result["transcript"],
+        "response_text": result["response_text"],
+        "relevant_alert_ids": result["relevant_alert_ids"],
+        "intent": result["intent"],
+        "clarification_required": result["clarification_required"],
+        "audio_available": result["audio_available"],
+        "audio_base64": audio_base64,
+        "action_taken": result["action_taken"],
+    }
+
+
+@app.post(
+    "/api/v1/voice/synthesize",
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def voice_synthesize_endpoint(
+    payload: VoiceSynthesizeRequest,
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    """Synthesize text into playable WAV audio using local TTS engine."""
+    del current_user
+    if not voice_tts.is_available():
+        raise HTTPException(
+            status_code=503,
+            detail="Text-to-speech service is disabled or unavailable.",
+        )
+    try:
+        wav_bytes = voice_tts.synthesize(payload.text)
+        return Response(content=wav_bytes, media_type="audio/wav")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"TTS synthesis failed: {str(exc)}") from exc
+
+
+@app.get("/api/v1/voice/status")
+def voice_status_endpoint():
+    """Report readiness status of local voice agent components."""
+    return {
+        "stt": {
+            "engine": "mlx-whisper",
+            "available": voice_stt.is_available(),
+            "enabled": voice_stt.enabled,
+        },
+        "llm": {
+            "engine": "ollama",
+            "enabled": voice_engine.llm_enabled,
+            "url": voice_engine.ollama_url,
+            "model": voice_engine.ollama_model,
+        },
+        "tts": {
+            "engine": "piper-local" if voice_tts.model_path else "synthetic-pcm",
+            "available": voice_tts.is_available(),
+            "enabled": voice_tts.enabled,
+            "model_path": voice_tts.model_path,
+        },
+        "telephony": {
+            "enabled": os.environ.get("KINTSUTECH_TELEPHONY_ENABLED", "false").lower() in ("true", "1"),
+            "provider": "pstn-disabled",
+        },
+    }
 
