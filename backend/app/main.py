@@ -20,8 +20,14 @@ from app.rate_limiter import rate_limit_mutations, rate_limit_webhooks
 
 from app.auth import (
     AuthenticatedUser,
+    CallerIdentity,
+    authenticate_caller,
     get_current_user,
     get_optional_current_user,
+    require_admin_or_api_key,
+    require_authenticated_caller,
+    require_repair_operator,
+    resolve_repair_authorizer,
     verify_supabase_token,
     SUPABASE_URL,
     SUPABASE_JWT_SECRET,
@@ -660,7 +666,7 @@ def list_services():
 def register_service(
     service_id: str,
     payload: ServiceRegisterRequest,
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """Register or update a monitored service."""
     try:
@@ -704,7 +710,7 @@ def get_service_baseline(service_id: str):
 def save_service_baseline(
     service_id: str,
     payload: BaselineSaveRequest,
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """Save a new versioned baseline for a service."""
     try:
@@ -830,8 +836,13 @@ def get_auth_health():
         jwt_secret_configured=bool(SUPABASE_JWT_SECRET),
         protected_endpoints=[
             "/api/v1/auth/me",
+            "/api/v1/auth/sync",
+            "/api/v1/users",
             "/api/v1/repairs/activate",
             "/api/v1/repairs/rollback",
+            "/api/v1/repairs/audit",
+            "/api/v1/webhooks/deliveries",
+            "/api/v1/webhooks/subscriptions",
         ],
     )
 
@@ -868,6 +879,8 @@ def verify_token_endpoint(
     """
     Verify the supplied Supabase access token (via Bearer header or request body),
     save user identity into local SQLite database, and return safe identity information.
+    Prefers 'Authorization: Bearer <token>' header for frontend calls.
+    Raw tokens are never logged or persisted.
     Rejects missing, expired, or invalid tokens with HTTP 401.
     """
     token = None
@@ -885,6 +898,9 @@ def verify_token_endpoint(
         )
 
     user = verify_supabase_token(token)
+    # Clear local token reference
+    del token
+
     storage_registry.sync_user(
         user_id=user.id,
         email=user.email,
@@ -952,8 +968,13 @@ def sync_user_profile(
 
 
 @app.get("/api/v1/users")
-def list_local_users():
-    """List all registered users stored in the local SQLite database."""
+def list_local_users(
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
+):
+    """
+    List all registered users stored in the local SQLite database.
+    Restricted to administrators, owners, or server-to-server integrations to prevent account enumeration.
+    """
     return {"users": storage_registry.list_users()}
 
 
@@ -982,22 +1003,17 @@ def logout_endpoint(
 )
 def activate_repair(
     payload: RepairActivationRequest,
-    auth_user: str = Depends(verify_api_key),
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    caller: CallerIdentity = Depends(authenticate_caller),
 ):
     """
     Guarded repair activation.
     Rejected if proposal has not passed independent validation, adapter hash mismatch,
     or contract version mismatch.
+    Requires explicit authorization via server API key or verified Supabase operator token.
+    Client-supplied authorizer is ignored for authenticated user sessions in favor of verified claims.
     """
+    authorizer = resolve_repair_authorizer(caller, payload)
     try:
-        authorizer = (
-            payload.authorizer
-            or (current_user.display_name if current_user else None)
-            or (current_user.email if current_user else None)
-            or (current_user.id if current_user else None)
-            or auth_user
-        )
         activation = storage_registry.activate_repair(
             payload.incident_id,
             payload.adapter,
@@ -1036,7 +1052,7 @@ def list_consumer_contracts(service_id: str | None = Query(default=None)):
 )
 def register_consumer_contract(
     payload: ConsumerContractRequest,
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """Register or update a downstream consumer contract."""
     try:
@@ -1052,20 +1068,15 @@ def register_consumer_contract(
 )
 def rollback_repair(
     payload: RepairRollbackRequest,
-    auth_user: str = Depends(verify_api_key),
-    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+    caller: CallerIdentity = Depends(authenticate_caller),
 ):
     """
     Deactivate active adapter and restore service to un-adapted baseline state.
+    Requires explicit authorization via server API key or verified Supabase operator token.
+    Client-supplied authorizer is ignored for authenticated user sessions in favor of verified claims.
     """
+    authorizer = resolve_repair_authorizer(caller, payload)
     try:
-        authorizer = (
-            payload.authorizer
-            or (current_user.display_name if current_user else None)
-            or (current_user.email if current_user else None)
-            or (current_user.id if current_user else None)
-            or auth_user
-        )
         rollback = storage_registry.rollback_repair(
             payload.service_id,
             authorizer=authorizer,
@@ -1089,7 +1100,9 @@ def rollback_repair(
 
 
 @app.get("/api/v1/repairs/audit")
-def get_repair_audit_log():
+def get_repair_audit_log(
+    caller: CallerIdentity = Depends(require_authenticated_caller),
+):
     """Retrieve audit trail of all repair validations, activations, and rollbacks."""
     return {"audit_log": storage_registry.get_audit_log()}
 
@@ -1149,7 +1162,7 @@ async def receive_incoming_webhook(request: Request):
 )
 def create_webhook_subscription(
     payload: WebhookSubscriptionRequest,
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """Register an outgoing webhook destination."""
     try:
@@ -1170,7 +1183,7 @@ def create_webhook_subscription(
 
 @app.get("/api/v1/webhooks/subscriptions")
 def list_webhook_subscriptions(
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """List active outgoing webhook subscriptions with secrets redacted."""
     return {"subscriptions": webhook_manager.list_subscriptions()}
@@ -1179,7 +1192,7 @@ def list_webhook_subscriptions(
 @app.get("/api/v1/webhooks/subscriptions/{subscription_id}")
 def get_webhook_subscription(
     subscription_id: str,
-    auth_user: str = Depends(verify_api_key),
+    caller: CallerIdentity = Depends(require_admin_or_api_key),
 ):
     """Get a specific webhook subscription with secret redacted."""
     sub = storage_registry.get_webhook_subscription(subscription_id, include_secret=False)
@@ -1189,7 +1202,9 @@ def get_webhook_subscription(
 
 
 @app.get("/api/v1/webhooks/deliveries")
-def get_webhook_deliveries():
+def get_webhook_deliveries(
+    caller: CallerIdentity = Depends(require_authenticated_caller),
+):
     """Retrieve outgoing webhook delivery logs and retry records."""
     return {"deliveries": webhook_manager.get_delivery_logs()}
 

@@ -15,6 +15,12 @@ def get_configured_api_key() -> str | None:
     return os.environ.get("KINTSUTECH_API_KEY") or os.environ.get("API_KEY")
 
 
+def is_production() -> bool:
+    """Determine whether the application is running in a production environment."""
+    env = (os.environ.get("ENVIRONMENT") or os.environ.get("KINTSUTECH_ENV") or "development").lower()
+    return env in ("production", "prod")
+
+
 def is_auth_enforced() -> bool:
     """
     Determine whether API-key authentication is enforced.
@@ -24,9 +30,8 @@ def is_auth_enforced() -> bool:
     """
     if get_configured_api_key():
         return True
-    env = os.environ.get("ENVIRONMENT", "development").lower()
     require_auth = os.environ.get("KINTSUTECH_REQUIRE_AUTH", "false").lower() in ("true", "1")
-    return env == "production" or require_auth
+    return is_production() or require_auth
 
 
 INSECURE_SECRETS_BLACKLIST = {
@@ -57,8 +62,7 @@ def validate_production_config() -> None:
     Fail-closed validation of production environment configuration.
     Refuses startup if required secrets or safe configurations are missing.
     """
-    env = (os.environ.get("ENVIRONMENT") or os.environ.get("KINTSUTECH_ENV") or "development").lower()
-    if env != "production":
+    if not is_production():
         return
 
     # 1. API key required in production
