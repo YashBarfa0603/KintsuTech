@@ -1319,7 +1319,14 @@ def _transcribe_local_audio(file_path: str) -> str:
             language=language,
             verbose=False,
         )
-    return str(result.get("text", "")).strip()
+    transcript = str(result.get("text", "")).strip()
+
+    # Correct common Whisper variations of the project name.
+    transcript = transcript.replace("Kinsu Tech", "KintsuTech")
+    transcript = transcript.replace("KinsuTech", "KintsuTech")
+    transcript = transcript.replace("Kintsu tech", "KintsuTech")
+
+    return transcript
 
 
 @app.post(
