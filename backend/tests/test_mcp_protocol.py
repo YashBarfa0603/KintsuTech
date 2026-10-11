@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -221,8 +222,8 @@ def test_mcp_validate_repair_proposal_non_mutating():
 
 def test_mcp_mutating_tools_security_and_authorization(monkeypatch):
     """Verify mutating MCP tools require authentication when configured and do not leak secrets."""
-    secret_key = "kintsu-secure-api-key-999"
-    monkeypatch.setenv("KINTSUTECH_API_KEY", secret_key)
+    mock_api_key = f"mock-test-key-{secrets.token_hex(16)}"
+    monkeypatch.setenv("KINTSUTECH_API_KEY", mock_api_key)
     monkeypatch.setenv("KINTSUTECH_REQUIRE_AUTH", "true")
 
     async def _test():
@@ -239,7 +240,7 @@ def test_mcp_mutating_tools_security_and_authorization(monkeypatch):
             data = parse_tool_result(res)
             assert "error" in data
             assert "Unauthorized" in data["error"]
-            assert secret_key not in json.dumps(data), "Must not leak secret key in error output"
+            assert mock_api_key not in json.dumps(data), "Must not leak secret key in error output"
 
             # 2. request_repair_activation with invalid api_key
             res = await session.call_tool(
@@ -291,8 +292,8 @@ def test_mcp_repair_activation_guardrails_and_rollback(monkeypatch):
     - Activates validated adapter with authorized key
     - Successfully rolls back active adapter
     """
-    secret_key = "kintsu-admin-key-777"
-    monkeypatch.setenv("KINTSUTECH_API_KEY", secret_key)
+    mock_admin_key = f"mock-admin-key-{secrets.token_hex(16)}"
+    monkeypatch.setenv("KINTSUTECH_API_KEY", mock_admin_key)
 
     async def _test():
         async with create_test_mcp_client() as session:
@@ -339,7 +340,7 @@ def test_mcp_repair_activation_guardrails_and_rollback(monkeypatch):
                     "incident_id": inc_id,
                     "adapter": tampered_adapter,
                     "authorizer": "lead_eng",
-                    "api_key": secret_key,
+                    "api_key": mock_admin_key,
                 },
             )
             tampered_data = parse_tool_result(res_tampered)
@@ -353,7 +354,7 @@ def test_mcp_repair_activation_guardrails_and_rollback(monkeypatch):
                     "incident_id": inc_id,
                     "adapter": validated_adapter,
                     "authorizer": "lead_eng",
-                    "api_key": secret_key,
+                    "api_key": mock_admin_key,
                 },
             )
             act_data = parse_tool_result(res_activate)
@@ -367,7 +368,7 @@ def test_mcp_repair_activation_guardrails_and_rollback(monkeypatch):
                     "service_id": "weather",
                     "authorizer": "lead_eng",
                     "reason": "Routine rollback test via genuine MCP",
-                    "api_key": secret_key,
+                    "api_key": mock_admin_key,
                 },
             )
             rb_data = parse_tool_result(res_rollback)

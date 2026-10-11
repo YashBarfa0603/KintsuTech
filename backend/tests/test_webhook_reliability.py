@@ -1,4 +1,5 @@
 import json
+import secrets
 import socket
 import time
 from unittest.mock import patch
@@ -442,7 +443,7 @@ def test_duplicate_event_handling_and_bounded_idempotency_retention():
 
 def test_error_sanitization_in_delivery_records():
     """Verify sensitive tokens and secrets are redacted from delivery error details."""
-    secret = "super_private_subscriber_key_999"
+    secret = f"mock-subscriber-key-{secrets.token_hex(16)}"
     raw_error = (
         f"Request failed with authorization Bearer my_secret_token_abc and "
         f"secret {secret} and X-API-Key: sensitive_api_key_555"

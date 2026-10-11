@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
+import secrets
 import tempfile
 import pytest
 from fastapi.testclient import TestClient
@@ -23,7 +24,7 @@ def test_production_config_missing_api_key(monkeypatch):
     monkeypatch.setenv("ENVIRONMENT", "production")
     monkeypatch.delenv("KINTSUTECH_API_KEY", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)
-    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", "super-secret-webhook-key-12345")
+    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", f"mock-wh-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "https://app.kintsutech.com")
 
     with pytest.raises(RuntimeError, match="KINTSUTECH_API_KEY must be set in production"):
@@ -33,7 +34,7 @@ def test_production_config_missing_api_key(monkeypatch):
 def test_production_config_insecure_api_key(monkeypatch):
     """Refuse startup in production if KINTSUTECH_API_KEY is too short or insecure default."""
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", "super-secret-webhook-key-12345")
+    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", f"mock-wh-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "https://app.kintsutech.com")
 
     # Short key
@@ -50,7 +51,7 @@ def test_production_config_insecure_api_key(monkeypatch):
 def test_production_config_missing_or_insecure_webhook_secret(monkeypatch):
     """Refuse startup in production if KINTSUTECH_WEBHOOK_SECRET is missing or weak."""
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "prod_api_key_9876543210_abcdef")
+    monkeypatch.setenv("KINTSUTECH_API_KEY", f"mock-key-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "https://app.kintsutech.com")
 
     monkeypatch.delenv("KINTSUTECH_WEBHOOK_SECRET", raising=False)
@@ -65,8 +66,8 @@ def test_production_config_missing_or_insecure_webhook_secret(monkeypatch):
 def test_production_config_wildcard_cors_rejected(monkeypatch):
     """Refuse startup in production if FRONTEND_ORIGINS contains wildcard '*'."""
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "prod_api_key_9876543210_abcdef")
-    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", "prod_webhook_key_9876543210_abcdef")
+    monkeypatch.setenv("KINTSUTECH_API_KEY", f"mock-key-{secrets.token_hex(16)}")
+    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", f"mock-wh-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "*")
 
     with pytest.raises(RuntimeError, match="cannot contain wildcard"):
@@ -76,8 +77,8 @@ def test_production_config_wildcard_cors_rejected(monkeypatch):
 def test_production_config_valid(monkeypatch):
     """Accept valid production configuration without exceptions."""
     monkeypatch.setenv("ENVIRONMENT", "production")
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "prod_api_key_9876543210_abcdef")
-    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", "prod_webhook_key_9876543210_abcdef")
+    monkeypatch.setenv("KINTSUTECH_API_KEY", f"mock-key-{secrets.token_hex(16)}")
+    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", f"mock-wh-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "https://kintsu.example.com,https://admin.kintsu.example.com")
 
     # Should not raise
@@ -357,7 +358,8 @@ def test_repeated_lifespan_cycles():
 
 def test_mcp_streamable_http_auth_enforcement(monkeypatch):
     """Verify remote HTTP callers cannot invoke mutating MCP tools without valid HTTP headers."""
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "prod_api_key_secure_123456789")
+    mock_api_key = f"mock-key-{secrets.token_hex(16)}"
+    monkeypatch.setenv("KINTSUTECH_API_KEY", mock_api_key)
 
     class MockRemoteHTTPContext:
         def __init__(self, headers: dict[str, str]):
@@ -365,19 +367,19 @@ def test_mcp_streamable_http_auth_enforcement(monkeypatch):
 
     # 1. Remote HTTP with no headers, but api_key provided in argument -> rejected
     ctx_no_header = MockRemoteHTTPContext(headers={"Host": "localhost"})
-    ok, err = check_mcp_authorization(ctx=ctx_no_header, api_key_arg="prod_api_key_secure_123456789")
+    ok, err = check_mcp_authorization(ctx=ctx_no_header, api_key_arg=mock_api_key)
     assert not ok
     assert "missing required" in err
 
     # 2. Remote HTTP with invalid X-API-Key header -> rejected
     ctx_bad_key = MockRemoteHTTPContext(headers={"Host": "localhost", "X-API-Key": "wrong-key"})
-    ok, err = check_mcp_authorization(ctx=ctx_bad_key, api_key_arg="prod_api_key_secure_123456789")
+    ok, err = check_mcp_authorization(ctx=ctx_bad_key, api_key_arg=mock_api_key)
     assert not ok
     assert "Invalid API key" in err
 
     # 3. Remote HTTP with valid X-API-Key header -> authorized
     ctx_valid_x_key = MockRemoteHTTPContext(
-        headers={"Host": "localhost", "X-API-Key": "prod_api_key_secure_123456789"}
+        headers={"Host": "localhost", "X-API-Key": mock_api_key}
     )
     ok, err = check_mcp_authorization(ctx=ctx_valid_x_key)
     assert ok
@@ -385,7 +387,7 @@ def test_mcp_streamable_http_auth_enforcement(monkeypatch):
 
     # 4. Remote HTTP with valid Authorization Bearer header -> authorized
     ctx_valid_bearer = MockRemoteHTTPContext(
-        headers={"Host": "localhost", "Authorization": "Bearer prod_api_key_secure_123456789"}
+        headers={"Host": "localhost", "Authorization": f"Bearer {mock_api_key}"}
     )
     ok, err = check_mcp_authorization(ctx=ctx_valid_bearer)
     assert ok
@@ -394,10 +396,11 @@ def test_mcp_streamable_http_auth_enforcement(monkeypatch):
 
 def test_mcp_stdio_auth_fallback(monkeypatch):
     """Verify local stdio transport (ctx is None) accepts tool argument api_key."""
-    monkeypatch.setenv("KINTSUTECH_API_KEY", "prod_api_key_secure_123456789")
+    mock_api_key = f"mock-key-{secrets.token_hex(16)}"
+    monkeypatch.setenv("KINTSUTECH_API_KEY", mock_api_key)
 
     # 1. Local stdio with valid tool argument -> authorized
-    ok, err = check_mcp_authorization(ctx=None, api_key_arg="prod_api_key_secure_123456789")
+    ok, err = check_mcp_authorization(ctx=None, api_key_arg=mock_api_key)
     assert ok
     assert err is None
 
@@ -418,7 +421,7 @@ def test_production_config_with_kintsutech_env_variable(monkeypatch):
     monkeypatch.setenv("KINTSUTECH_ENV", "production")
     monkeypatch.delenv("KINTSUTECH_API_KEY", raising=False)
     monkeypatch.delenv("API_KEY", raising=False)
-    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", "super-secret-webhook-key-12345")
+    monkeypatch.setenv("KINTSUTECH_WEBHOOK_SECRET", f"mock-wh-{secrets.token_hex(16)}")
     monkeypatch.setenv("FRONTEND_ORIGINS", "https://app.kintsutech.com")
 
     with pytest.raises(RuntimeError, match="KINTSUTECH_API_KEY must be set in production"):
