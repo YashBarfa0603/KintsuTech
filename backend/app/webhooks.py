@@ -1,5 +1,7 @@
 import os
+import re
 import secrets
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -12,27 +14,45 @@ import uuid
 import httpx
 
 from app.security import validate_target_url
+from app.storage import storage_registry, StorageRegistry
 
 
 DEFAULT_WEBHOOK_SECRET = os.environ.get("KINTSUTECH_WEBHOOK_SECRET") or ""
 
 
+def sanitize_error(error_str: str | None, secret: str | None = None) -> str | None:
+    """Sanitize error messages to ensure secrets or headers are never leaked."""
+    if not error_str:
+        return None
+    sanitized = str(error_str)
+    if secret and secret in sanitized:
+        sanitized = sanitized.replace(secret, "[REDACTED]")
+    sanitized = re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer [REDACTED]", sanitized)
+    sanitized = re.sub(r"X-API-Key:\s*[^\s,]+", "X-API-Key: [REDACTED]", sanitized)
+    sanitized = re.sub(r"X-KintsuTech-Signature:\s*[^\s,]+", "X-KintsuTech-Signature: [REDACTED]", sanitized)
+    return sanitized[:255]
+
+
 class WebhookManager:
     """
     Manages incoming webhook signature verification, deduplication,
-    outgoing event subscriptions, SSRF validation, and delivery with retries.
+    outgoing event subscriptions, SSRF validation, and reliable delivery with retries.
+    Backed by SQLite storage via StorageRegistry.
     """
 
-    def __init__(self, secret: str | None = None) -> None:
+    def __init__(
+        self,
+        secret: str | None = None,
+        storage: StorageRegistry | None = None,
+    ) -> None:
         if secret:
             self.secret = secret
         else:
             env_secret = os.environ.get("KINTSUTECH_WEBHOOK_SECRET")
             self.secret = env_secret if env_secret else secrets.token_hex(32)
+        self.storage = storage or storage_registry
         self._lock = Lock()
-        self._processed_events: set[str] = set()  # Event deduplication cache
-        self._subscriptions: dict[str, dict[str, Any]] = {}  # subscription_id -> sub
-        self._delivery_logs: list[dict[str, Any]] = []
+        self._executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="kintsu_webhook")
 
     def verify_signature(
         self,
@@ -88,12 +108,8 @@ class WebhookManager:
             return False
 
     def is_duplicate_event(self, event_id: str) -> bool:
-        """Check and record event_id for idempotency."""
-        with self._lock:
-            if event_id in self._processed_events:
-                return True
-            self._processed_events.add(event_id)
-            return False
+        """Check and record event_id for idempotency using persistent storage."""
+        return self.storage.is_duplicate_webhook_event(event_id)
 
     def subscribe(
         self,
@@ -108,30 +124,24 @@ class WebhookManager:
         validate_target_url(target_url, dns_resolver=dns_resolver)
 
         sub_secret = secret or self.secret or secrets.token_hex(32)
-
-        with self._lock:
-            sub_id = f"sub_{uuid.uuid4().hex[:12]}"
-            sub = {
-                "id": sub_id,
-                "target_url": target_url,
-                "events": events,
-                "secret": sub_secret,
-                "description": description,
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            self._subscriptions[sub_id] = sub
-            return sub
+        sub_id = f"sub_{uuid.uuid4().hex[:12]}"
+        sub = {
+            "id": sub_id,
+            "target_url": target_url,
+            "events": events,
+            "secret": sub_secret,
+            "description": description,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.storage.create_webhook_subscription(sub)
+        sanitized_sub = dict(sub)
+        sanitized_sub.pop("secret", None)
+        sanitized_sub["secret_configured"] = bool(sub_secret)
+        return sanitized_sub
 
     def list_subscriptions(self) -> list[dict[str, Any]]:
         """List active webhook subscriptions with secrets redacted."""
-        with self._lock:
-            sanitized: list[dict[str, Any]] = []
-            for sub in self._subscriptions.values():
-                entry = dict(sub)
-                entry.pop("secret", None)
-                entry["secret_configured"] = bool(sub.get("secret"))
-                sanitized.append(entry)
-            return sanitized
+        return self.storage.list_webhook_subscriptions(include_secret=False)
 
     def create_event(
         self,
@@ -168,30 +178,41 @@ class WebhookManager:
         client: httpx.Client | None = None,
         max_attempts: int = 3,
         dns_resolver: Callable[[str, int], list[tuple[Any, ...]]] | None = None,
+        backoff_base: float = 0.2,
     ) -> list[dict[str, Any]]:
         """
         Send event to all matching subscribers with HMAC signature and retries.
         Validates target URL immediately before dispatch to mitigate DNS rebinding.
         Enforces follow_redirects=False to prevent redirect-based SSRF bypass.
+        Persists each delivery record to SQLite storage.
         """
+        event_id = event.get("id")
+        if event_id and self.storage.is_duplicate_webhook_event(f"dispatch_{event_id}"):
+            return []
+
         event_type = event.get("type", "")
         payload_bytes = json.dumps(event).encode("utf-8")
 
         matched_subs = []
-        with self._lock:
-            for sub in self._subscriptions.values():
-                if "*" in sub["events"] or event_type in sub["events"]:
-                    matched_subs.append(sub)
+        all_subs = self.storage.list_webhook_subscriptions(include_secret=True)
+        for sub in all_subs:
+            sub_events = sub.get("events", [])
+            if "*" in sub_events or event_type in sub_events:
+                matched_subs.append(sub)
 
         delivery_results = []
+        timeout_config = httpx.Timeout(connect=2.0, read=3.0, write=3.0, pool=5.0)
+
         for sub in matched_subs:
             target_url = sub["target_url"]
+            sub_secret = sub.get("secret", self.secret)
 
             # Re-validate destination URL before dispatch to prevent DNS rebinding
             try:
                 validate_target_url(target_url, dns_resolver=dns_resolver)
             except ValueError as val_err:
                 log_entry = {
+                    "delivery_id": f"del_{uuid.uuid4().hex[:12]}",
                     "event_id": event.get("id"),
                     "event_type": event_type,
                     "subscription_id": sub["id"],
@@ -199,15 +220,13 @@ class WebhookManager:
                     "attempts": 0,
                     "status": "failed",
                     "status_code": None,
-                    "error": f"SSRF blocked: {val_err}",
+                    "error": sanitize_error(f"SSRF blocked: {val_err}", sub_secret),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
-                with self._lock:
-                    self._delivery_logs.append(log_entry)
+                self.storage.record_webhook_delivery(log_entry)
                 delivery_results.append(log_entry)
                 continue
 
-            sub_secret = sub.get("secret", self.secret)
             sig_header = self.sign_payload(payload_bytes, sub_secret)
             headers = {
                 "Content-Type": "application/json",
@@ -219,47 +238,79 @@ class WebhookManager:
             status = "failed"
             status_code = None
             error = None
+            actual_attempts = 0
 
-            for attempt in range(1, max_attempts + 1):
+            bounded_attempts = max(1, min(max_attempts, 5))
+            for attempt in range(1, bounded_attempts + 1):
+                actual_attempts = attempt
                 try:
                     if client:
                         resp = client.post(target_url, content=payload_bytes, headers=headers)
                     else:
-                        with httpx.Client(timeout=5.0, follow_redirects=False) as default_client:
+                        with httpx.Client(timeout=timeout_config, follow_redirects=False) as default_client:
                             resp = default_client.post(target_url, content=payload_bytes, headers=headers)
 
                     status_code = resp.status_code
                     if resp.is_success:
                         status = "delivered"
+                        error = None
                         break
+                    else:
+                        error = f"HTTP {resp.status_code}"
                 except Exception as exc:
                     error = str(exc)
-                    if attempt == max_attempts:
-                        break
+
+                # Bounded backoff delay between retry attempts
+                if attempt < bounded_attempts and backoff_base > 0:
+                    time.sleep(min(backoff_base * (2 ** (attempt - 1)), 2.0))
 
             log_entry = {
+                "delivery_id": f"del_{uuid.uuid4().hex[:12]}",
                 "event_id": event.get("id"),
                 "event_type": event_type,
                 "subscription_id": sub["id"],
                 "target_url": target_url,
-                "attempts": attempt,
+                "attempts": actual_attempts,
                 "status": status,
                 "status_code": status_code,
-                "error": error,
+                "error": sanitize_error(error, sub_secret),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-            with self._lock:
-                self._delivery_logs.append(log_entry)
-
+            self.storage.record_webhook_delivery(log_entry)
             delivery_results.append(log_entry)
 
         return delivery_results
 
+    def dispatch_event_background(
+        self,
+        event: dict[str, Any],
+        *,
+        client: httpx.Client | None = None,
+        max_attempts: int = 3,
+        dns_resolver: Callable[[str, int], list[tuple[Any, ...]]] | None = None,
+        backoff_base: float = 0.2,
+    ) -> Future:
+        """
+        Asynchronously dispatch event to subscribers in a background thread pool.
+        Does not block the calling HTTP request.
+        """
+        return self._executor.submit(
+            self.dispatch_event,
+            event,
+            client=client,
+            max_attempts=max_attempts,
+            dns_resolver=dns_resolver,
+            backoff_base=backoff_base,
+        )
+
     def get_delivery_logs(self) -> list[dict[str, Any]]:
-        """Return delivery logs in reverse chronological order."""
-        with self._lock:
-            return list(reversed(self._delivery_logs))
+        """Return delivery logs in reverse chronological order from SQLite."""
+        return self.storage.list_webhook_deliveries(limit=100)
+
+    def shutdown(self, wait: bool = False) -> None:
+        """Shutdown background thread pool executor."""
+        self._executor.shutdown(wait=wait)
 
 
 # Singleton instance

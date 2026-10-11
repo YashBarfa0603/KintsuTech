@@ -224,6 +224,44 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/webhooks/subscriptions \
 - `validations`: Deterministic regression test verification outcomes with canonical `adapter_hash`.
 - `active_adapters`: Authorizer-guarded active repair adapters.
 - `audit_log`: Append-only audit trail recording timestamps and actors.
+- `webhook_subscriptions`: Persisted webhook subscriptions with target URL, event filters, active status, creation time, and securely stored secret.
+- `webhook_deliveries`: Persisted delivery attempts, statuses, HTTP status codes, timestamps, and sanitized errors.
+- `webhook_idempotency`: Processed event IDs with automatic bounded retention pruning.
+
+### Persistent, Reliable Webhooks (Phase 5B)
+
+1. **Persistent SQLite Storage**:
+   - Subscriptions, delivery logs, and idempotency records are stored in SQLite and survive application and `StorageRegistry` restarts.
+   - Database migrations use safe schema updates (`Base.metadata.create_all` and `ALTER TABLE`) without dropping existing data.
+   - High concurrency is handled using SQLite WAL mode (`PRAGMA journal_mode=WAL`) and a 5000ms busy timeout.
+
+2. **Secret Redaction**:
+   - Webhook secrets are never returned in ANY API response (`POST /api/v1/webhooks/subscriptions`, `GET /api/v1/webhooks/subscriptions`, or `GET /api/v1/webhooks/subscriptions/{id}`).
+   - API responses indicate whether a secret is configured (`"secret_configured": true`) without exposing the key material.
+
+3. **Non-Blocking Background Delivery**:
+   - Outgoing webhook delivery is completely decoupled from the critical path of repair activation, rollback, validation, and incident creation.
+   - Uses an in-process background worker pool (`ThreadPoolExecutor`) via `dispatch_event_background()`. Primary HTTP responses return immediately (< 50ms) even when webhook subscribers are slow or unreachable.
+   - *Architecture Note:* Delivery is best-effort in-process background work. In-flight jobs do not survive sudden process crashes.
+
+4. **Retry Policy & Timeout Limits**:
+   - Explicit timeout bounds: connect = 2.0s, read = 3.0s, write = 3.0s, pool = 5.0s.
+   - Bounded retries: up to 3 bounded attempts with exponential backoff (`0.2s * 2^(attempt-1)`, capped at 2.0s).
+   - `follow_redirects=False` strictly enforced to prevent redirect-based SSRF bypass.
+   - Target URLs are re-validated against SSRF / DNS rebinding immediately before every outbound request attempt.
+
+5. **Sanitized Error Logging**:
+   - Stored error messages in delivery logs are sanitized to remove Bearer tokens, API keys, signature headers, and subscriber secrets (`[REDACTED]`).
+
+6. **Bounded Idempotency Retention**:
+   - Incoming and outgoing events are deduplicated via `webhook_idempotency`.
+   - Bounded retention policy automatically prunes the oldest records when total entries exceed the limit (default 1,000), preventing database bloat.
+
+7. **Supported Event Types**:
+   - `incident.created`: Dispatched only after an incident is successfully detected and created in SQLite.
+   - `repair.validated`: Dispatched only after proposed repair adapter passes independent validation.
+   - `repair.activated`: Dispatched only after authorized repair activation succeeds (never emitted if activation fails or adapter hash mismatch occurs).
+   - `repair.rollback_completed`: Dispatched only after rollback completes.
 
 ---
 
@@ -232,17 +270,17 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/webhooks/subscriptions \
 Run all test suites across the project:
 
 ```bash
-# 1. Run backend tests (123 tests)
+# 1. Run backend tests (143 tests)
 cd backend && uv run pytest -q
 
 # 2. Run AI engine tests (78 tests)
 cd ../ai_engine && uv run pytest -q
 
 # 3. Compile checks across both projects
-cd .. && uv run python -m compileall -q backend/app ai_engine
+cd backend && uv run python -m compileall -q app tests && cd ../ai_engine && uv run python -m compileall -q -x "\.venv" .
 ```
 
-**Total automated tests:** **201 passed** (123 backend + 78 AI engine).
+**Total automated tests:** **221 passed** (143 backend + 78 AI engine).
 
 ---
 

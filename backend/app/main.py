@@ -474,6 +474,14 @@ def analyze_with_ai(payload: AIAnalyzeRequest):
                 )
                 result["incident_id"] = inc["id"]
 
+                # Dispatch incident.created webhook event
+                event = webhook_manager.create_event(
+                    "incident.created",
+                    inc,
+                    service_id=service_id,
+                )
+                webhook_manager.dispatch_event_background(event)
+
         return result
     except Exception as exc:
         raise HTTPException(
@@ -607,6 +615,24 @@ def validate_repair_proposal(payload: RepairValidationRequest):
             validation_result,
             adapter_config=payload.adapter,
         )
+
+        # Dispatch repair.validated webhook event upon successful validation
+        if validation_result.get("eligible_for_activation") or validation_result.get("passed"):
+            service_id = "kintsutech"
+            inc = storage_registry.get_incident(payload.incident_id)
+            if inc:
+                service_id = inc.get("service_id", "kintsutech")
+            event = webhook_manager.create_event(
+                "repair.validated",
+                {
+                    "incident_id": payload.incident_id,
+                    "validation": validation_result,
+                    "adapter": payload.adapter,
+                },
+                service_id=service_id,
+            )
+            webhook_manager.dispatch_event_background(event)
+
         return {
             "incident_id": payload.incident_id,
             "validation": validation_result,
@@ -632,13 +658,13 @@ def activate_repair(
             note=payload.note,
         )
 
-        # Notify subscribers
+        # Notify subscribers asynchronously in background
         event = webhook_manager.create_event(
             "repair.activated",
             activation,
             service_id=activation.get("service_id", "kintsutech"),
         )
-        webhook_manager.dispatch_event(event)
+        webhook_manager.dispatch_event_background(event)
 
         return {
             "status": "activated",
@@ -668,7 +694,7 @@ def rollback_repair(
             rollback,
             service_id=payload.service_id,
         )
-        webhook_manager.dispatch_event(event)
+        webhook_manager.dispatch_event_background(event)
 
         return {
             "status": "rolled_back",
@@ -743,7 +769,11 @@ def create_webhook_subscription(
             secret=payload.secret,
             description=payload.description,
         )
-        return {"status": "subscribed", "subscription": subscription}
+        # Ensure secret is never returned in response
+        sanitized_sub = dict(subscription)
+        sanitized_sub.pop("secret", None)
+        sanitized_sub["secret_configured"] = bool(subscription.get("secret_configured") or payload.secret)
+        return {"status": "subscribed", "subscription": sanitized_sub}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -754,6 +784,18 @@ def list_webhook_subscriptions(
 ):
     """List active outgoing webhook subscriptions with secrets redacted."""
     return {"subscriptions": webhook_manager.list_subscriptions()}
+
+
+@app.get("/api/v1/webhooks/subscriptions/{subscription_id}")
+def get_webhook_subscription(
+    subscription_id: str,
+    auth_user: str = Depends(verify_api_key),
+):
+    """Get a specific webhook subscription with secret redacted."""
+    sub = storage_registry.get_webhook_subscription(subscription_id, include_secret=False)
+    if not sub:
+        raise HTTPException(status_code=404, detail=f"Subscription '{subscription_id}' not found.")
+    return {"subscription": sub}
 
 
 @app.get("/api/v1/webhooks/deliveries")

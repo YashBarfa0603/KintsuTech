@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 from threading import Lock
 from typing import Any
+import uuid
 
 from sqlalchemy import (
     Boolean,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     Text,
     create_engine,
     delete,
+    event,
     func,
     select,
 )
@@ -106,6 +108,40 @@ class AuditLogModel(Base):
     timestamp = Column(String(50), nullable=False)
 
 
+class WebhookSubscriptionModel(Base):
+    __tablename__ = "webhook_subscriptions"
+
+    id = Column(String(50), primary_key=True)
+    target_url = Column(String(500), nullable=False)
+    events_json = Column(Text, nullable=False)
+    secret = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(String(50), nullable=False)
+
+
+class WebhookDeliveryModel(Base):
+    __tablename__ = "webhook_deliveries"
+
+    id = Column(String(50), primary_key=True)
+    event_id = Column(String(50), index=True, nullable=True)
+    event_type = Column(String(100), nullable=False)
+    subscription_id = Column(String(50), index=True, nullable=False)
+    target_url = Column(String(500), nullable=False)
+    attempts = Column(Integer, default=1, nullable=False)
+    status = Column(String(50), nullable=False)
+    status_code = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    timestamp = Column(String(50), nullable=False)
+
+
+class WebhookIdempotencyModel(Base):
+    __tablename__ = "webhook_idempotency"
+
+    event_id = Column(String(100), primary_key=True)
+    received_at = Column(String(50), nullable=False)
+
+
 # Default persistent file location outside source code
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_DB_FILE = DEFAULT_DATA_DIR / "kintsutech.db"
@@ -156,12 +192,27 @@ class StorageRegistry:
                     connect_args={"check_same_thread": False},
                 )
 
+        if "sqlite" in self._db_url:
+            @event.listens_for(self._engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                try:
+                    cursor.execute("PRAGMA journal_mode=WAL")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("PRAGMA busy_timeout=5000")
+                except Exception:
+                    pass
+                cursor.close()
+
         Base.metadata.create_all(self._engine)
         self._migrate_schema()
         self._session_factory = sessionmaker(bind=self._engine)
 
     def _migrate_schema(self) -> None:
         """Ensure schema compatibility for existing SQLite databases."""
+        Base.metadata.create_all(self._engine)
         with self._engine.begin() as conn:
             try:
                 result = conn.exec_driver_sql("PRAGMA table_info(validations)")
@@ -745,6 +796,175 @@ class StorageRegistry:
                 rows = session.scalars(select(AuditLogModel).order_by(AuditLogModel.id.desc())).all()
                 return [json.loads(r.payload_json) for r in rows]
 
+    def create_webhook_subscription(
+        self,
+        sub: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a new or updated webhook subscription to SQLite."""
+        with self._lock:
+            with self._get_session() as session:
+                sub_id = sub["id"]
+                row = WebhookSubscriptionModel(
+                    id=sub_id,
+                    target_url=sub["target_url"],
+                    events_json=json.dumps(sub.get("events", ["*"])),
+                    secret=sub.get("secret", ""),
+                    description=sub.get("description", ""),
+                    is_active=sub.get("is_active", True),
+                    created_at=sub.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                )
+                session.merge(row)
+                session.commit()
+                return deepcopy(sub)
+
+    def list_webhook_subscriptions(
+        self,
+        include_secret: bool = False,
+        active_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List persisted webhook subscriptions with optional secret redaction."""
+        with self._lock:
+            with self._get_session() as session:
+                stmt = select(WebhookSubscriptionModel)
+                if active_only:
+                    stmt = stmt.where(WebhookSubscriptionModel.is_active.is_(True))
+                stmt = stmt.order_by(WebhookSubscriptionModel.created_at.asc())
+                rows = session.scalars(stmt).all()
+                result = []
+                for r in rows:
+                    entry = {
+                        "id": r.id,
+                        "target_url": r.target_url,
+                        "events": json.loads(r.events_json),
+                        "description": r.description,
+                        "is_active": r.is_active,
+                        "created_at": r.created_at,
+                    }
+                    if include_secret:
+                        entry["secret"] = r.secret
+                    else:
+                        entry["secret_configured"] = bool(r.secret)
+                    result.append(entry)
+                return result
+
+    def get_webhook_subscription(
+        self,
+        sub_id: str,
+        include_secret: bool = False,
+    ) -> dict[str, Any] | None:
+        """Retrieve a specific webhook subscription."""
+        with self._lock:
+            with self._get_session() as session:
+                r = session.get(WebhookSubscriptionModel, sub_id)
+                if not r:
+                    return None
+                entry = {
+                    "id": r.id,
+                    "target_url": r.target_url,
+                    "events": json.loads(r.events_json),
+                    "description": r.description,
+                    "is_active": r.is_active,
+                    "created_at": r.created_at,
+                }
+                if include_secret:
+                    entry["secret"] = r.secret
+                else:
+                    entry["secret_configured"] = bool(r.secret)
+                return entry
+
+    def record_webhook_delivery(
+        self,
+        log_entry: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a webhook delivery attempt and status record to SQLite."""
+        with self._lock:
+            with self._get_session() as session:
+                del_id = log_entry.get("delivery_id") or f"del_{uuid.uuid4().hex[:12]}"
+                log_entry["delivery_id"] = del_id
+                now_str = log_entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
+                row = WebhookDeliveryModel(
+                    id=del_id,
+                    event_id=log_entry.get("event_id"),
+                    event_type=log_entry.get("event_type", "unknown"),
+                    subscription_id=log_entry.get("subscription_id", ""),
+                    target_url=log_entry.get("target_url", ""),
+                    attempts=int(log_entry.get("attempts", 1)),
+                    status=log_entry.get("status", "unknown"),
+                    status_code=log_entry.get("status_code"),
+                    error=log_entry.get("error"),
+                    timestamp=now_str,
+                )
+                session.add(row)
+                session.commit()
+                return deepcopy(log_entry)
+
+    def list_webhook_deliveries(
+        self,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve recent webhook delivery records in reverse chronological order."""
+        with self._lock:
+            with self._get_session() as session:
+                stmt = (
+                    select(WebhookDeliveryModel)
+                    .order_by(WebhookDeliveryModel.timestamp.desc())
+                    .limit(limit)
+                )
+                rows = session.scalars(stmt).all()
+                return [
+                    {
+                        "delivery_id": r.id,
+                        "event_id": r.event_id,
+                        "event_type": r.event_type,
+                        "subscription_id": r.subscription_id,
+                        "target_url": r.target_url,
+                        "attempts": r.attempts,
+                        "status": r.status,
+                        "status_code": r.status_code,
+                        "error": r.error,
+                        "timestamp": r.timestamp,
+                    }
+                    for r in rows
+                ]
+
+    def is_duplicate_webhook_event(
+        self,
+        event_id: str,
+        max_retention: int = 1000,
+    ) -> bool:
+        """
+        Check if an incoming webhook event has already been processed (idempotency).
+        Enforces a bounded retention limit by purging oldest records when exceeded.
+        """
+        if not event_id:
+            return False
+        with self._lock:
+            with self._get_session() as session:
+                exists = session.get(WebhookIdempotencyModel, str(event_id))
+                if exists:
+                    return True
+                now_str = datetime.now(timezone.utc).isoformat()
+                session.add(WebhookIdempotencyModel(event_id=str(event_id), received_at=now_str))
+
+                # Bounded retention policy: purge oldest if total entries exceed max_retention
+                total_count = session.scalar(select(func.count(WebhookIdempotencyModel.event_id)))
+                if total_count and total_count > max_retention:
+                    excess = total_count - max_retention
+                    subq = (
+                        select(WebhookIdempotencyModel.event_id)
+                        .order_by(WebhookIdempotencyModel.received_at.asc())
+                        .limit(excess)
+                    )
+                    old_ids = session.scalars(subq).all()
+                    if old_ids:
+                        session.execute(
+                            delete(WebhookIdempotencyModel).where(
+                                WebhookIdempotencyModel.event_id.in_(old_ids)
+                            )
+                        )
+                session.commit()
+                return False
+
     def reset(self) -> None:
         """Utility to wipe all storage tables (useful for isolated tests)."""
         with self._lock:
@@ -755,6 +975,9 @@ class StorageRegistry:
                 session.execute(delete(BaselineModel))
                 session.execute(delete(ServiceModel))
                 session.execute(delete(AuditLogModel))
+                session.execute(delete(WebhookDeliveryModel))
+                session.execute(delete(WebhookSubscriptionModel))
+                session.execute(delete(WebhookIdempotencyModel))
                 session.commit()
 
 
