@@ -80,6 +80,7 @@ from app.provider_client import (
 )
 from app.storage import storage_registry
 from app.webhooks import webhook_manager
+from app.agent import AgentChatRequest, AgentChatResponse, AgentEngine
 
 
 # Request models
@@ -305,6 +306,7 @@ app.add_middleware(BoundedBodyLimitMiddleware, default_max_size=MAX_REQUEST_BODY
 observer = APIObserver()
 health_monitor = APIHealthMonitor()
 dependency_graph = create_default_dependency_graph()
+agent_engine = AgentEngine(health_monitor=health_monitor)
 
 # Seed weather service and baseline in storage registry idempotently
 storage_registry.register_service(
@@ -1242,4 +1244,29 @@ def execute_mcp_tool(
     if "error" in result and result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return {"tool": payload.name, "result": result}
+
+
+# Conversational AI Agent Endpoint
+
+
+@app.post(
+    "/api/v1/agent/chat",
+    response_model=AgentChatResponse,
+    dependencies=[Depends(rate_limit_mutations)],
+)
+def chat_with_agent(
+    payload: AgentChatRequest,
+    current_user: AuthenticatedUser | None = Depends(get_optional_current_user),
+):
+    """
+    Conversational AI agent endpoint grounded in live KintsuTech backend tools and telemetry.
+    Answers general queries and diagnoses API drift, consumer blast radius, and recovery proposals.
+    """
+    is_admin = current_user.is_admin if current_user else False
+    user_id = current_user.id if current_user else "anonymous"
+    return agent_engine.process_query(
+        query=payload.message,
+        caller_is_admin=is_admin,
+        caller_id=user_id,
+    )
 

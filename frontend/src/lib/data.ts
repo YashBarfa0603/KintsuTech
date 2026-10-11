@@ -358,6 +358,7 @@ export const screenMeta: Record<Screen, [string, string]> = {
   history: ["Recovery History", "Review recovery decisions, evidence, and audit history."],
   integrations: ["Integrations", "Connect contracts and developer workflow evidence."],
   settings: ["Workspace settings", "Manage environments, policies, and team access."],
+  chat: ["AI Agent Chat", "Grounded conversational diagnostics, change analysis, and voice interaction."],
 };
 
 export function myersEditDistance(before: string[], after: string[]): number {

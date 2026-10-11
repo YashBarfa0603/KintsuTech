@@ -68,7 +68,15 @@ KintsuTech is an API change detection, impact analysis, AI-assisted repair, vali
     - AI assistant drawer accessible from anywhere in the workspace
     - Contextual Q&A grounded in active case evidence
     - Simulated voice input toggle
-11. **Supabase Authentication:**
+11. **Autonomous AI Agent Chat & Voice Integration (`/chat`):**
+    - Full-page dedicated AI Agent conversation interface
+    - Grounded responses backed by live FastAPI backend tools (`POST /api/v1/agent/chat`)
+    - Real-time diagnostic tool calling (system health, service telemetry, dependency blast radius, repair proposals, rollback assessment)
+    - Web Speech API **Speech-to-Text** voice input (Microphone button, recording pulse, permission handling)
+    - Web Speech API **Text-to-Speech** voice output (Listen button on assistant bubbles, pause/resume/stop, voice rate and language settings)
+    - Hands-free auto-send speech mode and starter prompt chips
+    - Conversation history persisted with clear confirmation
+12. **Supabase Authentication:**
     - Modal for sign in / sign up
     - Role-based identity display and token verification
 

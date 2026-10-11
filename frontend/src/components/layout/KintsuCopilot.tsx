@@ -96,6 +96,15 @@ export function KintsuCopilot({
             <button onClick={() => navigate("graph")}>Impact path</button>
             <button onClick={() => navigate("validation")}>Test logs</button>
             <button onClick={() => navigate("history")}>History</button>
+            <button
+              onClick={() => {
+                close();
+                navigate("chat");
+              }}
+              className="text-emerald-700 font-semibold hover:underline"
+            >
+              Full Agent Chat ↗
+            </button>
           </div>
         </div>
 

@@ -22,6 +22,7 @@ import { ValidationLabScreen } from "@/components/screens/ValidationLabScreen";
 import { HistoryScreen } from "@/components/screens/HistoryScreen";
 import { IntegrationsScreen } from "@/components/screens/IntegrationsScreen";
 import { SettingsScreen } from "@/components/screens/SettingsScreen";
+import { AgentChatScreen } from "@/components/screens/AgentChatScreen";
 import { KintsuCopilot } from "@/components/layout/KintsuCopilot";
 import { AuthModal } from "@/components/layout/AuthModal";
 
@@ -201,6 +202,16 @@ export function AppShell({
               )}
             </div>
 
+            {/* Chat with AI Agent Entry */}
+            <button
+              className={`copilot-trigger ${screen === "chat" ? "ring-2 ring-emerald-500" : ""}`}
+              onClick={() => navigate("chat")}
+              title="Open full AI Agent Chat"
+            >
+              <Icon name="spark" size={15} />
+              <span>Chat with AI Agent</span>
+            </button>
+
             {/* Kintsu Copilot Trigger */}
             <button
               className="copilot-trigger"
@@ -335,6 +346,13 @@ export function AppShell({
             History
           </button>
 
+          <button
+            className={screen === "chat" ? "active" : ""}
+            onClick={() => navigate("chat")}
+          >
+            AI Agent Chat
+          </button>
+
           {/* Settings Dropdown */}
           <div className="nav-dropdown">
             <button
@@ -445,6 +463,7 @@ export function AppShell({
             setDependencies={setDependencies}
           />
         )}
+        {screen === "chat" && <AgentChatScreen navigate={navigate} />}
         {screen === "settings" && <SettingsScreen resetDemo={resetDemo} />}
       </main>
 

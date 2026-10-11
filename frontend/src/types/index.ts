@@ -8,7 +8,8 @@ export type Screen =
   | "validation"
   | "history"
   | "integrations"
-  | "settings";
+  | "settings"
+  | "chat";
 
 export type Project = {
   id: string;
