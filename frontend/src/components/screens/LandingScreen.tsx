@@ -184,6 +184,9 @@ export function LandingScreen({ onEnter, onOpenAuth, isAuthenticated = false }: 
           </div>
 
           <div className="nav-actions">
+            <Button variant="secondary" onClick={() => onEnter("overview")}>
+              Enter Workspace
+            </Button>
             <Button variant="ghost" onClick={handleSignIn}>
               Sign In
             </Button>
@@ -249,11 +252,11 @@ export function LandingScreen({ onEnter, onOpenAuth, isAuthenticated = false }: 
               Detect external dependency changes, trace their impact, and prove compatibility repairs before applying them.
             </p>
             <div className="hero-actions">
-              <Button onClick={handleSignUp} icon="arrow">
+              <Button onClick={() => onEnter("overview")} icon="arrow">
                 Explore KintsuTech
               </Button>
-              <Button variant="secondary" icon="play" onClick={watchRecovery}>
-                Watch the recovery
+              <Button variant="secondary" icon="graph" onClick={() => onEnter("graph")}>
+                AI Dependency Graph
               </Button>
             </div>
           </div>

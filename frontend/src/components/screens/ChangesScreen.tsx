@@ -10,10 +10,12 @@ export function ChangesScreen({
   changes,
   setChanges,
   navigate,
+  setActiveIncidentId,
 }: {
   changes: ChangeRecord[];
   setChanges: (changes: ChangeRecord[]) => void;
   navigate: (screen: Screen) => void;
+  setActiveIncidentId?: (id: string) => void;
 }) {
   const [search, setSearch] = useState("");
   const [severity, setSeverity] = useState("All severities");
@@ -156,7 +158,10 @@ export function ChangesScreen({
             {visible.map((change) => (
               <button
                 key={change.id}
-                onClick={() => setSelectedId(change.id)}
+                onClick={() => {
+                  setSelectedId(change.id);
+                  setActiveIncidentId?.(incidentIdForChange(change));
+                }}
                 className="w-full p-4 text-left flex items-center justify-between hover:bg-stone-50 transition-colors"
               >
                 <div className="flex items-start gap-3">
@@ -243,12 +248,14 @@ export function ChangesScreen({
               </Button>
               <Button
                 onClick={() => {
+                  const targetInc = incidentIdForChange(selected);
+                  setActiveIncidentId?.(targetInc);
                   updateStatus(selected.id, "Recovery open");
                   navigate("recovery");
                 }}
                 icon="recovery"
               >
-                Create recovery case
+                Open Recovery Case ({incidentIdForChange(selected)})
               </Button>
             </div>
 

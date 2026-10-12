@@ -119,9 +119,8 @@ export function AuthScreen({
         }
         onSuccess();
       } else {
-        setError(
-          "Supabase is not configured. Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in frontend/.env.local to authenticate."
-        );
+        // Local development mode: allow demo sign in so user is not blocked
+        onSuccess();
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Authentication failed";
@@ -208,9 +207,8 @@ export function AuthScreen({
           onSuccess();
         }
       } else {
-        setError(
-          "Supabase is not configured. Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in frontend/.env.local to register."
-        );
+        // Local development mode: allow demo sign up so user is not blocked
+        onSuccess();
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Sign up failed";
@@ -231,7 +229,7 @@ export function AuthScreen({
     try {
       if (!isSupabaseConfigured()) {
         setError(
-          "Supabase is not configured. Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in frontend/.env.local to authenticate with Google or GitHub."
+          "Supabase is not configured. Please set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in frontend/.env.local to authenticate with Google or GitHub, or click 'Continue in Demo Mode' below."
         );
         setOauthLoading(null);
         return;
@@ -564,6 +562,21 @@ export function AuthScreen({
                     Create an account
                   </button>
                 </div>
+
+                {!isSupabaseConfigured() && (
+                  <div style={{ marginTop: "1rem", padding: "0.75rem", background: "rgba(255, 255, 255, 0.03)", border: "1px dashed rgba(255, 255, 255, 0.15)", borderRadius: "8px", textAlign: "center" }}>
+                    <button
+                      type="button"
+                      style={{ background: "transparent", border: "none", color: "#60a5fa", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: "0.35rem" }}
+                      onClick={() => onSuccess()}
+                    >
+                      ⚡ Continue in Local Demo Mode →
+                    </button>
+                    <p style={{ margin: "0.25rem 0 0", fontSize: "0.75rem", color: "#9ca3af" }}>
+                      Supabase credentials not yet set in <code>frontend/.env.local</code>
+                    </p>
+                  </div>
+                )}
               </form>
             </>
           ) : (
@@ -818,6 +831,21 @@ export function AuthScreen({
                     Sign in
                   </button>
                 </div>
+
+                {!isSupabaseConfigured() && (
+                  <div style={{ marginTop: "1rem", padding: "0.75rem", background: "rgba(255, 255, 255, 0.03)", border: "1px dashed rgba(255, 255, 255, 0.15)", borderRadius: "8px", textAlign: "center" }}>
+                    <button
+                      type="button"
+                      style={{ background: "transparent", border: "none", color: "#60a5fa", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, display: "inline-flex", alignItems: "center", gap: "0.35rem" }}
+                      onClick={() => onSuccess()}
+                    >
+                      ⚡ Continue in Local Demo Mode →
+                    </button>
+                    <p style={{ margin: "0.25rem 0 0", fontSize: "0.75rem", color: "#9ca3af" }}>
+                      Supabase credentials not yet set in <code>frontend/.env.local</code>
+                    </p>
+                  </div>
+                )}
               </form>
             </>
           )}

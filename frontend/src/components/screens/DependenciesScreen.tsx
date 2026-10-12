@@ -142,6 +142,9 @@ export function DependenciesScreen({
           </div>
         </div>
         <div className="page-actions">
+          <Button variant="secondary" icon="graph" onClick={() => navigate("graph")}>
+            AI Dependency Graph
+          </Button>
           <Button variant="secondary" icon="download" onClick={() => navigate("integrations")}>
             Import evidence
           </Button>

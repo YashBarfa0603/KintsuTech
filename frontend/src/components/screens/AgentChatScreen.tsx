@@ -71,26 +71,16 @@ export function AgentChatScreen({
   currentProject?: string;
   currentEnv?: string;
 }) {
-  const [messages, setMessages] = useState<ChatMessage[]>(() => {
-    if (typeof window !== "undefined") {
-      try {
-        const saved = window.localStorage.getItem("kintsutech:agent-chat-messages");
-        if (saved) return JSON.parse(saved);
-      } catch {
-        // fallback
-      }
-    }
-    return [
-      {
-        id: "msg-welcome",
-        sender: "agent",
-        text: "Hello! I am the **KintsuTech Autonomous Agent**. I can analyze API drift, calculate blast radius across downstream consumers, explain compatibility repairs, and report live system health grounded in backend telemetry.\n\nHow can I assist your integrations today?",
-        timestamp: "10:00",
-        toolsUsed: ["system_knowledge"],
-        source: "system_knowledge",
-      },
-    ];
-  });
+  const welcomeMessage: ChatMessage = {
+    id: "msg-welcome",
+    sender: "agent",
+    text: "Hello! I am the **KintsuTech Autonomous Agent**. I can analyze API drift, calculate blast radius across downstream consumers, explain compatibility repairs, and report live system health grounded in backend telemetry.\n\nHow can I assist your integrations today?",
+    timestamp: formatCurrentTimestamp(),
+    toolsUsed: ["system_knowledge"],
+    source: "system_knowledge",
+  };
+
+  const [messages, setMessages] = useState<ChatMessage[]>([welcomeMessage]);
 
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -124,14 +114,7 @@ export function AgentChatScreen({
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  // Persist messages
-  useEffect(() => {
-    try {
-      window.localStorage.setItem("kintsutech:agent-chat-messages", JSON.stringify(messages));
-    } catch {
-      // ignore
-    }
-  }, [messages]);
+  // Note: Chat messages are session-only. No localStorage persistence.
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -363,12 +346,13 @@ export function AgentChatScreen({
 
   const handleClearChat = () => {
     stopSpeech();
+    messageSeq = 0;
     setMessages([
       {
-        id: `msg-${Date.now()}`,
+        id: "msg-welcome-reset",
         sender: "agent",
         text: "Conversation cleared. How can I assist your integrations?",
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        timestamp: formatCurrentTimestamp(),
         toolsUsed: ["system_knowledge"],
       },
     ]);

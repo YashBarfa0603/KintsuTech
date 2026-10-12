@@ -8,6 +8,10 @@ import {
   Project,
   ChangeRecord,
   GraphData,
+  GraphNode,
+  GraphNodeKind,
+  GraphStatus,
+  GraphEdge,
   IncidentWorkspaceRecord,
 } from "@/types";
 
@@ -319,9 +323,35 @@ export async function fetchDependencyGraphTopology(): Promise<GraphData | null> 
       const data = await res.json();
       const rawGraph = data.dependency_graph;
       if (rawGraph && Array.isArray(rawGraph.nodes) && Array.isArray(rawGraph.edges)) {
+        const nodes: GraphNode[] = rawGraph.nodes.map((n: any) => ({
+          id: n.id,
+          kind: (["application", "api", "dependency"].includes(n.kind) ? n.kind : "dependency") as GraphNodeKind,
+          subtype: n.subtype || (n.is_critical ? "Critical Service" : "Service"),
+          name: n.name || n.id.replace(/_/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase()),
+          detail: n.detail || n.endpoint || n.description || "",
+          status: (["healthy", "affected", "failed"].includes(n.status) ? n.status : "healthy") as GraphStatus,
+          project: n.project || "Pulse API",
+          environment: n.environment || "Production",
+          provider: n.provider || "Kintsu Core",
+          method: n.method || (n.detail?.startsWith("POST") ? "POST" : "GET"),
+          evidence: n.evidence || n.description || "Registered service",
+          source: n.source || "inventory",
+        }));
+
+        const edges: GraphEdge[] = rawGraph.edges.map((e: any, idx: number) => ({
+          id: e.id || `edge-${e.from || e.source}-${e.to || e.target}-${idx}`,
+          from: e.from || e.source,
+          to: e.to || e.target,
+          label: e.label || e.interaction || "api_call",
+          evidence: (e.evidence || "confirmed") as "confirmed" | "inferred" | "unknown",
+          confidence: e.confidence ?? 95,
+          source: e.source || "Service Registry",
+          status: (e.status || "healthy") as "healthy" | "affected" | "failed",
+        }));
+
         return {
-          nodes: rawGraph.nodes,
-          edges: rawGraph.edges,
+          nodes,
+          edges,
         };
       }
     }

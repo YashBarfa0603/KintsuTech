@@ -61,6 +61,7 @@ export function AppShell({
 
   const [caseStatus, setCaseStatus] = useState<"review" | "validated" | "approved" | "rejected">("review");
   const [validationState, setValidationState] = useState<"idle" | "running" | "done" | "failed">("idle");
+  const [activeIncidentId, setActiveIncidentId] = useState<string>("KIN-2841");
 
   const [user, setUser] = useState<{ email: string; initials: string; role: string } | null>({
     email: "akira@kintsu.tech",
@@ -373,11 +374,17 @@ export function AppShell({
           >
             Dependencies
           </button>
+          <button
+            className={screen === "graph" ? "active" : ""}
+            onClick={() => navigate("graph")}
+          >
+            AI Dependency Graph
+          </button>
 
           {/* Investigate Dropdown */}
           <div className="nav-dropdown">
             <button
-              className={screen === "changes" || screen === "graph" ? "active" : ""}
+              className={screen === "changes" ? "active" : ""}
               onClick={() => setNavDropdown(navDropdown === "investigate" ? null : "investigate")}
             >
               Investigate <Icon name="chevron" size={11} />
@@ -389,13 +396,6 @@ export function AppShell({
                   <span>
                     <strong>Change Detection</strong>
                     <small>Review observed changes</small>
-                  </span>
-                </button>
-                <button onClick={() => navigate("graph")}>
-                  <Icon name="graph" size={16} />
-                  <span>
-                    <strong>AI Dependency Graph</strong>
-                    <small>Trace established impact</small>
                   </span>
                 </button>
               </div>
@@ -487,6 +487,7 @@ export function AppShell({
             projects={projects}
             currentProject={project}
             currentEnv={env}
+            setActiveIncidentId={setActiveIncidentId}
           />
         )}
         {screen === "projects" && (
@@ -511,7 +512,12 @@ export function AppShell({
           />
         )}
         {screen === "changes" && (
-          <ChangesScreen changes={changes} setChanges={setChanges} navigate={navigate} />
+          <ChangesScreen
+            changes={changes}
+            setChanges={setChanges}
+            navigate={navigate}
+            setActiveIncidentId={setActiveIncidentId}
+          />
         )}
         {screen === "graph" && (
           <ImpactGraphScreen
@@ -531,6 +537,8 @@ export function AppShell({
             validationState={validationState}
             runValidation={runValidation}
             navigate={navigate}
+            activeIncidentId={activeIncidentId}
+            setActiveIncidentId={setActiveIncidentId}
           />
         )}
         {screen === "validation" && (

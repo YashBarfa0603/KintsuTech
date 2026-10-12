@@ -16,6 +16,7 @@ export function OverviewScreen({
   projects,
   currentProject = "Pulse API",
   currentEnv = "Staging",
+  setActiveIncidentId,
 }: {
   navigate: (s: Screen) => void;
   caseStatus: string;
@@ -26,6 +27,7 @@ export function OverviewScreen({
   projects: Project[];
   currentProject?: string;
   currentEnv?: string;
+  setActiveIncidentId?: (id: string) => void;
 }) {
   const [activityFilter, setActivityFilter] = useState("All activity");
 
@@ -138,6 +140,29 @@ export function OverviewScreen({
         </div>
       </div>
 
+      <section className="panel mb-6 p-4 bg-stone-900 text-white rounded-md flex items-center justify-between shadow-sm border border-stone-800">
+        <div className="flex items-center gap-4">
+          <div className="p-3 bg-stone-800 rounded-lg text-emerald-400 border border-stone-700">
+            <Icon name="graph" size={24} />
+          </div>
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-xs font-mono font-bold tracking-wider text-emerald-400 uppercase">
+                AI Service Dependency Graph & Blast Radius
+              </span>
+              <Badge tone="danger">2 Schema Drifts Active</Badge>
+              <Badge tone="success">14 Services Mapped</Badge>
+            </div>
+            <p className="text-xs text-stone-300">
+              Live topology mapping Weather Mock (<code>temp_c</code> drift), Stripe Checkout (<code>display_name</code> drift), Vapi Voice Escalation, and Supabase Auth Gateway.
+            </p>
+          </div>
+        </div>
+        <Button variant="primary" icon="graph" onClick={() => navigate("graph")}>
+          Explore AI Dependency Graph
+        </Button>
+      </section>
+
       <section className="panel mb-6">
         <div className="p-4 border-b border-stone-200 flex items-center justify-between">
           <div>
@@ -152,7 +177,10 @@ export function OverviewScreen({
           {activeChanges.map((change) => (
             <div
               key={change.id}
-              onClick={() => navigate("recovery")}
+              onClick={() => {
+                setActiveIncidentId?.(incidentIdForChange(change));
+                navigate("recovery");
+              }}
               className="p-4 flex items-center justify-between hover:bg-stone-50 cursor-pointer"
             >
               <div className="flex items-start gap-3">

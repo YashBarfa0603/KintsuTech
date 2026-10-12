@@ -38,6 +38,20 @@ export const defaultProjects: Project[] = [
 
 export const defaultChanges: ChangeRecord[] = [
   {
+    id: "CHG-842",
+    dependencyType: "API",
+    service: "Weather Intelligence API",
+    endpoint: "GET /api/v1/mock/weather",
+    category: "Renamed response field",
+    severity: "Critical",
+    confidence: 99.4,
+    status: "Investigating",
+    summary: "Response field temperature was migrated to temp_c.",
+    observed: "Today, 14:35 UTC",
+    evidence: "Myers diff detected on live GET /api/v1/mock/weather; downstream trip_planner and severe alert failures",
+    breaking: true,
+  },
+  {
     id: "CHG-841",
     dependencyType: "API",
     service: "Stripe",
@@ -174,38 +188,71 @@ export const graphDependencyType = (node?: GraphNode): DependencyType =>
 
 export const defaultGraphData: GraphData = {
   nodes: [
-    { id: "app-web", kind: "application", subtype: "Web application", name: "Web App", detail: "Customer checkout and travel planning", status: "affected", project: "Pulse API", environment: "Production", evidence: "Registered application", source: "demo" },
-    { id: "app-mobile", kind: "application", subtype: "Mobile application", name: "Mobile App", detail: "iOS and Android customer experience", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Registered application", source: "demo" },
-    { id: "app-admin", kind: "application", subtype: "Internal application", name: "Admin Portal", detail: "Operations and inventory management", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Registered application", source: "demo" },
-    { id: "api-weather", kind: "api", subtype: "API", name: "Weather API", detail: "api.weather.example/v2", status: "healthy", project: "Pulse API", environment: "Production", provider: "Weather Co", method: "GET", evidence: "Developer-defined contract", source: "demo" },
-    { id: "api-payment", kind: "api", subtype: "API", name: "Payment API", detail: "api.stripe.com/v1", status: "affected", project: "Pulse API", environment: "Production", provider: "Stripe", method: "GET", evidence: "Imported contract + observed responses", source: "demo" },
-    { id: "api-inventory", kind: "api", subtype: "API", name: "Inventory API", detail: "inventory.example/v1", status: "healthy", project: "Pulse API", environment: "Production", provider: "Acme Inventory", method: "GET", evidence: "Developer-defined contract", source: "demo" },
-    { id: "webhook-payment", kind: "api", subtype: "Webhook", name: "Stripe Payment Webhook", detail: "payment.succeeded · POST /webhooks/stripe", status: "affected", project: "Pulse API", environment: "Production", provider: "Stripe", method: "POST", evidence: "Configured receiver + reported payload fixture", source: "demo" },
-    { id: "dep-weather", kind: "dependency", subtype: "Service", name: "Weather Service", detail: "services/weather.ts", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Repository reference", source: "demo" },
-    { id: "dep-travel", kind: "dependency", subtype: "Workflow", name: "Travel Planner", detail: "WF-TRAVEL-04", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Developer-defined mapping", source: "demo" },
-    { id: "dep-analytics", kind: "dependency", subtype: "Response field", name: "Analytics", detail: "payment.display_name", status: "affected", project: "Pulse API", environment: "Production", evidence: "Observed trace + repository usage", source: "demo" },
-    { id: "dep-notifications", kind: "dependency", subtype: "Service", name: "Notification Service", detail: "services/notifications.ts", status: "affected", project: "Pulse API", environment: "Production", evidence: "Developer-defined mapping", source: "demo" },
-    { id: "dep-payment-event", kind: "dependency", subtype: "Webhook event", name: "payment.succeeded", detail: "event handlers/payment-succeeded.ts", status: "affected", project: "Pulse API", environment: "Production", evidence: "Registered event subscription", source: "demo" },
-    { id: "dep-webhook-customer", kind: "dependency", subtype: "Payload field", name: "customer_display_name", detail: "data.object.customer_display_name", status: "affected", project: "Pulse API", environment: "Production", evidence: "Reported redacted payload fixture", source: "demo" },
+    // Column 1: Applications & Consumers
+    { id: "app-checkout", kind: "application", subtype: "Core Business Service", name: "Checkout Order Service", detail: "backend/app/checkout_service.py · POST /api/v1/checkout/process", status: "affected", project: "Pulse API", environment: "Production", evidence: "412 Precondition Failed when reading paymentIntent.name", source: "inventory" },
+    { id: "app-console", kind: "application", subtype: "SPA Web Dashboard", name: "Kintsu Admin Console", detail: "Incident triage & developer studio (http://localhost:3000)", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Active operator session", source: "inventory" },
+    { id: "app-scheduler", kind: "application", subtype: "Escalation Engine", name: "Persistent Alert Scheduler", detail: "backend/app/scheduler.py · Telephony claim daemon", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Idempotent claim & quiet hours guard active", source: "inventory" },
+    { id: "app-mobile", kind: "application", subtype: "Mobile Client", name: "Client Mobile Experience", detail: "apps/mobile/weather_widget.tsx", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Observed 200 OK traffic", source: "inventory" },
+
+    // Column 2: External APIs & Gateways (Real KintsuTech APIs)
+    { id: "api-products", kind: "api", subtype: "Internal REST API", name: "Product Catalog API", detail: "GET /api/v1/products", status: "healthy", project: "Pulse API", environment: "Production", provider: "Kintsu Catalog Service", method: "GET", evidence: "OpenAPI 3.1 contract active", source: "inventory" },
+    { id: "api-stripe", kind: "api", subtype: "Payment & Webhooks", name: "Stripe Payment Gateway", detail: "POST /v1/payment_intents/:id · POST /webhooks/stripe", status: "affected", project: "Pulse API", environment: "Production", provider: "Stripe Inc.", method: "POST", evidence: "Incident KIN-2841: display_name -> name field mismatch", source: "inventory" },
+    { id: "api-supabase", kind: "api", subtype: "Auth & GoTrue Gateway", name: "Supabase Identity Gateway", detail: "https://djmgakxzxqyquvmkhkxo.supabase.co/auth/v1", status: "healthy", project: "Pulse API", environment: "Production", provider: "Supabase Cloud", method: "POST", evidence: "Verified URL & anon key in frontend/.env.local", source: "inventory" },
+    { id: "api-vapi", kind: "api", subtype: "Telephony & Voice AI", name: "Vapi Voice Agent Gateway", detail: "POST https://api.vapi.ai/call/phone · POST /api/vapi/webhook", status: "healthy", project: "Pulse API", environment: "Production", provider: "Vapi Voice Platform", method: "POST", evidence: "Assistant asst_kintsu_voice_v1; caller +12025550199", source: "inventory" },
+    { id: "api-weather", kind: "api", subtype: "External REST API", name: "Weather Intelligence API", detail: "GET /api/v1/mock/weather", status: "affected", project: "Pulse API", environment: "Production", provider: "OpenWeather Mock", method: "GET", evidence: "Myers schema drift detected: temperature (removed) -> temp_c (added)", source: "inventory" },
+
+    // Column 3: Dependent Services & Components
+    { id: "dep-catalog", kind: "dependency", subtype: "Search & Cache", name: "Catalog Search Service", detail: "backend/app/catalog_service.py", status: "healthy", project: "Pulse API", environment: "Production", evidence: "In-memory cache warmed", source: "inventory" },
+    { id: "dep-inventory", kind: "dependency", subtype: "Warehouse Datastore", name: "Warehouse Inventory", detail: "GET /api/v1/inventory", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Stock synchronization active", source: "inventory" },
+    { id: "dep-ledger", kind: "dependency", subtype: "Accounting Pipeline", name: "Billing Ledger Sync", detail: "services/ledger_sync.ts", status: "affected", project: "Pulse API", environment: "Production", evidence: "Awaiting schema repair mapping proposal", source: "inventory" },
+    { id: "dep-rbac", kind: "dependency", subtype: "Security Middleware", name: "JWT RBAC Security Guard", detail: "backend/app/auth.py · HS256 verify", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Validates HS256 JWT signatures on protected routes", source: "inventory" },
+    { id: "dep-voice-logger", kind: "dependency", subtype: "Audit & Compliance", name: "Telephony Audit Logger", detail: "backend/app/storage.py (AlertDeliveryModel)", status: "healthy", project: "Pulse API", environment: "Production", evidence: "Verified webhook signature callbacks and delivery logs", source: "inventory" },
+    { id: "dep-trip", kind: "dependency", subtype: "Core Workflow", name: "Trip Planner Engine", detail: "services/weather.ts:42", status: "affected", project: "Pulse API", environment: "Production", evidence: "Direct consumer of weather.temperature; unhandled 412 in parser", source: "inventory" },
+    { id: "dep-alert", kind: "dependency", subtype: "Incident Pipeline", name: "Severe Alert Service", detail: "backend/app/scheduler.py:78", status: "affected", project: "Pulse API", environment: "Production", evidence: "Trigger threshold calculation failed on missing temperature float", source: "inventory" },
   ],
   edges: [
-    { id: "edge-web-weather", from: "app-web", to: "api-weather", label: "uses forecast", evidence: "confirmed", source: "Application registration", status: "healthy" },
-    { id: "edge-mobile-weather", from: "app-mobile", to: "api-weather", label: "uses forecast", evidence: "confirmed", source: "Application registration", status: "healthy" },
-    { id: "edge-web-payment", from: "app-web", to: "api-payment", label: "processes checkout", evidence: "confirmed", source: "Developer-defined mapping", status: "affected" },
-    { id: "edge-admin-payment", from: "app-admin", to: "api-payment", label: "views payments", evidence: "confirmed", source: "Repository configuration", status: "affected" },
-    { id: "edge-admin-inventory", from: "app-admin", to: "api-inventory", label: "manages stock", evidence: "confirmed", source: "Application registration", status: "healthy" },
-    { id: "edge-weather-service", from: "api-weather", to: "dep-weather", label: "GET /forecast", evidence: "confirmed", source: "Imported OpenAPI contract", status: "healthy" },
-    { id: "edge-weather-travel", from: "api-weather", to: "dep-travel", label: "weather.condition", evidence: "inferred", confidence: 87, source: "Request traces", status: "healthy" },
-    { id: "edge-payment-analytics", from: "api-payment", to: "dep-analytics", label: "display_name field", evidence: "confirmed", source: "Repository usage + 412 responses", status: "affected" },
-    { id: "edge-payment-notify", from: "api-payment", to: "dep-notifications", label: "payment succeeded", evidence: "confirmed", source: "Developer-defined mapping", status: "affected" },
-    { id: "edge-inventory-notify", from: "api-inventory", to: "dep-notifications", label: "low stock event", evidence: "inferred", confidence: 82, source: "Configuration trace", status: "healthy" },
-    { id: "edge-web-webhook", from: "app-web", to: "webhook-payment", label: "receives payment events", evidence: "confirmed", source: "Webhook registration", status: "affected" },
-    { id: "edge-webhook-event", from: "webhook-payment", to: "dep-payment-event", label: "routes payment.succeeded", evidence: "confirmed", source: "Configured subscription", status: "affected" },
-    { id: "edge-webhook-field", from: "webhook-payment", to: "dep-webhook-customer", label: "reads payload field", evidence: "confirmed", source: "Reported fixture + handler reference", status: "affected" },
+    // Column 1 (Applications) -> Column 2 (APIs)
+    { id: "edge-checkout-products", from: "app-checkout", to: "api-products", label: "GET /api/v1/products", evidence: "confirmed", source: "Order Checkout Service", status: "healthy" },
+    { id: "edge-checkout-stripe", from: "app-checkout", to: "api-stripe", label: "processes checkout (display_name)", evidence: "confirmed", source: "Incident KIN-2841", status: "affected" },
+    { id: "edge-console-supabase", from: "app-console", to: "api-supabase", label: "Bearer token auth session", evidence: "confirmed", source: "Auth Middleware", status: "healthy" },
+    { id: "edge-scheduler-vapi", from: "app-scheduler", to: "api-vapi", label: "outbound escalation dispatch", evidence: "confirmed", source: "Escalation Scheduler", status: "healthy" },
+    { id: "edge-mobile-weather", from: "app-mobile", to: "api-weather", label: "GET /weather (cached widget)", evidence: "confirmed", source: "Application Registration", status: "affected" },
+
+    // Column 2 (APIs) -> Column 3 (Dependencies)
+    { id: "edge-products-catalog", from: "api-products", to: "dep-catalog", label: "GET /api/v1/products", evidence: "confirmed", source: "Catalog Service", status: "healthy" },
+    { id: "edge-products-inventory", from: "api-products", to: "dep-inventory", label: "reserves warehouse stock", evidence: "confirmed", source: "Inventory Service", status: "healthy" },
+    { id: "edge-stripe-ledger", from: "api-stripe", to: "dep-ledger", label: "payment.succeeded event", evidence: "confirmed", source: "Webhook Subscription", status: "affected" },
+    { id: "edge-supabase-rbac", from: "api-supabase", to: "dep-rbac", label: "HS256 JWT claim verify", evidence: "confirmed", source: "Auth Middleware", status: "healthy" },
+    { id: "edge-vapi-logger", from: "api-vapi", to: "dep-voice-logger", label: "call-report webhook callbacks", evidence: "confirmed", source: "Webhook Ingest", status: "healthy" },
+    { id: "edge-weather-trip", from: "api-weather", to: "dep-trip", label: "GET /forecast (temp_c drift)", evidence: "confirmed", source: "Observed Myers Diff", status: "affected" },
+    { id: "edge-weather-alert", from: "api-weather", to: "dep-alert", label: "evaluates freeze thresholds", evidence: "confirmed", source: "Scheduler Pipeline", status: "affected" },
   ],
 };
 
 export const incidentWorkspaceRecords: IncidentWorkspaceRecord[] = [
+  {
+    id: "KIN-2842",
+    dependencyType: "API",
+    title: "Weather API temperature field migrated to temp_c",
+    api: "Weather Intelligence API",
+    endpoint: "GET /api/v1/mock/weather",
+    detected: "Today, 14:35",
+    environment: "Staging",
+    severity: "Critical",
+    state: "Pending review",
+    applications: ["Client Mobile Experience", "Trip Planner Engine", "Severe Alert Service"],
+    workflows: ["Travel Weather Advisory", "Freeze Alert Evaluation"],
+    baseline: { city: "San Francisco", condition: "Sunny", humidity: 65, temperature: 21.5, status: "active" },
+    current: { city: "San Francisco", condition: "Sunny", humidity: 65, temp_c: 21.5, status: "active" },
+    proposalTitle: "Preserve the internal temperature contract with temp_c fallback",
+    problem: "Upstream mock weather provider renamed 'temperature' to 'temp_c'. Downstream trip planner and alert scheduler fail with 412 unhandled key errors.",
+    expected: "Downstream travel workflows and severe alert evaluation receive a normalized temperature field without runtime failure.",
+    operation: "map_field(temp_c → temperature) with legacy fallback and unit preservation",
+    originalCode: `export function parseWeatherData(payload: RawWeatherResponse) {\n  return {\n    city: payload.city,\n    temperature: payload.temperature,\n    condition: payload.condition\n  };\n}`,
+    proposedCode: `export function parseWeatherData(payload: RawWeatherResponse) {\n  return {\n    city: payload.city,\n    temperature: payload.temp_c ?? payload.temperature,\n    sourceField: payload.temp_c !== undefined ? "temp_c" : "temperature",\n    condition: payload.condition\n  };\n}`,
+    supported: true,
+    evidence: ["Myers diff score: 98.4% confidence", "Endpoint GET /api/v1/mock/weather live probe", "Downstream failure at services/weather.ts:42", "Scheduler freeze alert calculation regression"],
+  },
   {
     id: "KIN-2841",
     dependencyType: "API",
@@ -323,16 +370,16 @@ export const incidentWorkspaceRecords: IncidentWorkspaceRecord[] = [
   },
 ];
 
-export const incidentIdForChange = (change: ChangeRecord) =>
-  change.dependencyType === "SDK"
-    ? "KIN-SDK-102"
-    : change.dependencyType === "MCP Server"
-    ? "KIN-MCP-104"
-    : change.dependencyType === "Webhook"
-    ? "KIN-WHK-108"
-    : change.id === "CHG-838"
-    ? "KIN-2794"
-    : "KIN-2841";
+export const incidentIdForChange = (change: ChangeRecord) => {
+  if (change.id === "CHG-842" || change.service?.toLowerCase().includes("weather") || change.endpoint?.includes("weather")) {
+    return "KIN-2842";
+  }
+  if (change.dependencyType === "SDK") return "KIN-SDK-102";
+  if (change.dependencyType === "MCP Server") return "KIN-MCP-104";
+  if (change.dependencyType === "Webhook") return "KIN-WHK-108";
+  if (change.id === "CHG-838" || change.service?.toLowerCase().includes("sendgrid")) return "KIN-2794";
+  return "KIN-2841";
+};
 
 export const navItems: { id: Screen; label: string; icon: IconName }[] = [
   { id: "overview", label: "Overview", icon: "home" },
