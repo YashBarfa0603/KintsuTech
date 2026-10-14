@@ -411,7 +411,7 @@ npm run build
 | Frontend production build | Successful |
 | **Total Python tests** | **407 passed** |
  
-These results were recorded during development checks on October 12, 2026. They describe the tested code at that point and are not a guarantee of production reliability.
+These results were recorded during development checks
  
 ---
  
